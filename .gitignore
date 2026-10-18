@@ -1,0 +1,17 @@
+# build outputs
+build/
+host/build/
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+# editor / OS
+.vscode/
+.idea/
+*.uvguix.*
+Thumbs.db
+# research artifacts fetched by tooling
+docs/research/**/build*/
+docs/research/**/*.o
