@@ -1,5 +1,6 @@
 # build outputs
 build/
+build-mingw/
 host/build/
 *.o
 *.obj

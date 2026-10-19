@@ -224,7 +224,8 @@ LFS/LFD/LPMD/LAMD、`[LPMS:3|LFW:3|LKS:1]`、TRNSP、10 字节音名。
   `synth_set_engine_type(0|1|2)`。
 - SD 端口 `Synth/port/sample_storage_sd.c`：`synth_port_sample_load_wav(path, root, low, high, loop, loop_start, loop_end)`
   —— 自家 RIFF 解析（只接受 PCM 16bit、1–2 声道），立体声下混为单声道，数据写入
-  **512KB 静态采样池**（`g_sample_pool`，`SYNTH_PORT_AUDIO_RAM` → `.ram_section` = AXI SRAM）；
+  **128KB 静态采样池**（`g_sample_pool`，`SYNTH_PORT_AUDIO_RAM` → `.ram_section` = AXI SRAM，
+  大小见 `Synth/port/synth_port_config.h` 的 `SYNTH_PORT_SAMPLE_POOL_BYTES`）；
   `synth_port_sample_activate()` 把乐器交给引擎并切到 ROMpler；`synth_port_sample_pool_reset()` 清空。
   可多次调用以组成**多音区**乐器（不同音域不同采样）。
 

@@ -44,7 +44,16 @@ int      synth_port_sample_add_qspi(uint32_t byte_offset, uint32_t frames, uint3
 void     synth_port_sample_qspi_activate(const char *name);
 
 /* 诊断计数 */
-extern volatile uint32_t g_synth_audio_xruns;
+extern volatile uint32_t g_synth_audio_xruns;   /* 音频 DMA 欠载次数（0 = 健康） */
+extern volatile uint32_t g_synth_midi_rx_bytes; /* USB-MIDI 收到的字节数（弹键就涨） */
+extern volatile uint32_t g_synth_usb_mount_count;  /* 主机完成枚举的次数（反复增长 = 主机在反复重枚举） */
+extern volatile uint32_t g_synth_usb_umount_count; /* USB 掉线次数 */
+/* 存活探针：连读两次比较 systick_ticks/loop_count 判断是「主循环卡死」还是「卡在中断里」 */
+extern volatile uint32_t g_synth_systick_ticks;    /* SysTick 中断次数（1 kHz） */
+extern volatile uint32_t g_synth_usb_isr_depth;    /* >0 = 正在 USB 中断里 */
+extern volatile uint32_t g_synth_audio_isr_depth;  /* >0 = 正在音频 DMA 中断里渲染 */
+extern volatile uint32_t g_synth_usb_irq_count;    /* OTG_FS 中断次数（诊断：恒为 0 = 核没中断） */
+extern volatile uint32_t g_synth_usb_clk_rc;       /* USB 内核时钟配置的 HAL 返回值（0 = HAL_OK） */
 
 #ifdef __cplusplus
 }

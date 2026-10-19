@@ -50,8 +50,8 @@ zone1.loop = 0
 | -5 | 采样载入失败 |
 
 ## 采样存放两条路
-- **SD 卡**：放 WAV，由 `Synth/port/sample_storage_sd.c` 读入 **512KB RAM 采样池**（AXI SRAM，`.ram_section`）；
-  池大小用 `SYNTH_SAMPLE_POOL_BYTES` 调整。
+- **SD 卡**：放 WAV，由 `Synth/port/sample_storage_sd.c` 读入 **128KB RAM 采样池**（AXI SRAM，`.ram_section`）；
+  池大小用 `Synth/port/synth_port_config.h` 的 `SYNTH_PORT_SAMPLE_POOL_BYTES` 调整（同时要 `SYNTH_PORT_SD_ENABLE=1`）。
 - **QSPI flash**：裸 16bit 单声道 PCM，用 `synth_port_sample_add_qspi()` **零拷贝**挂载
   （`zone->data = 0x90000000 + offset`；需内存映射模式 + 放开 MPU 对该区的 NO_ACCESS）。适合大采样库。
 

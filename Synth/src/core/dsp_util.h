@@ -5,6 +5,16 @@
 #include <math.h>
 #include <stdint.h>
 
+/* 把变量放进 DTCM 的「热点段」（链接脚本 STM32H750xx_FLASH.ld 里的 .dtcm_bss）。
+   内存策略：默认所有 .data/.bss 在 AXI SRAM（0x24000000），只有显式标注的常量表放 DTCM。
+   DTCM（0x20000000, 128KB）与 CPU 同频、零等待，AXI SRAM 要过总线矩阵 —— 每采样都查的
+   常量表值得搬进来（正弦表 4KB、波表 32KB）。
+   两条约束：① 该段是 NOLOAD！启动代码不清零，由 Core/Src/main.c 的 App_ZeroDtcmBss() 清；
+             ② DMA1/DMA2 访问不到 DTCM —— DMA 缓冲绝对不能标这个宏。 */
+#ifndef SYNTH_HOT
+#define SYNTH_HOT __attribute__((section(".dtcm_bss")))
+#endif
+
 namespace ssynth {
 
 constexpr float kPi     = 3.14159265358979f;
@@ -61,7 +71,7 @@ private:
     static constexpr int   kSize  = 1 << kBits;
     static constexpr int   kMask  = kSize - 1;
     static constexpr float kSizeF = (float)kSize;
-    static float table_[kSize];
+    static float SYNTH_HOT table_[kSize];   /* 4KB：振荡器每采样都查 → 放 DTCM */
 };
 
 /* 参数映射：音色里的 u8 → 物理量 */

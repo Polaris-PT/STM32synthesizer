@@ -15,7 +15,11 @@
     SAI1 的 MCLK=PE2、SAI2 的 PD11/PD12/PD13 都**撞板载 QSPI flash 连线**（CubeMX 允许 SAI2+QSPI 并存只是因为不知道板级连线）。
   - 依据：用户提供的外设接线图 + CubeMX 器件库 `...\STM32CubeMX\db\mcu\STM32H750VBTx.xml`。
 - 时钟树（**必须与 CubeMX 一致**）：HSE 25MHz；PLL1 M=5/N=192/P=2 → SYSCLK **480MHz**，Q=20 → **USB 48.000MHz**；
-  PLL2 M=5/N=39/FRACN=21076/P=8 → **24.576MHz** 给 SAI23 内核 ⇒ MCLK=12.288MHz(256fs)、MCKDIV=1 ⇒ **Fs=48.000kHz（0.00% 误差）**。
+  PLL2 M=5/N=108/FRACN=1101/P=22 → **24.57599987MHz** 给 SAI23 内核（−0.13Hz ≈ −5ppb）
+  ⇒ MCLK=12.288MHz(256fs)、**MCKDIV=2** ⇒ **Fs=48.000kHz（0.00% 误差）**。
+  **判据**：`SAI_CK` 必须是 **12.288MHz 的整数倍**（NODIV=0 时 `Fs = SAI_CK/(MCKDIV×256)`），
+  所以 48MHz 之类的时钟只能得到 46.875kHz（−2.34%）；24.576MHz 只能靠 FRACN 逼近
+  （FRACN 13bit，合法 0..8191；本文档早期写的 `N=39/FRACN=21076/P=8` 是**无效值**，已改正）。
   CubeMX 判据：SAI 参数页 `Real Audio Frequency = 48.000 kHz`、`Error = 0.00%`（参考工程当年是 46.875kHz/−2.34%）。
 - 其它外设：QSPI=PD13/PE2/PD12/PD11/PB2/PB6；SPIx=PB3/PB4/PD7/PD6；SDMMC1=PC8..PC12/PD2/PD4；
   ST7735=PE12/PE14/PE10/PE11/PE13/PE15；LED=PE3；USART1=PB14/PB15。
@@ -62,9 +66,60 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
    - 该测试已作为回归用例保留：`[rom] 直接驱动 Rompler 的交叉淡化诊断`（直接驱动）与
      `[rom] 循环接缝交叉淡化 / 三次插值`（经引擎请求槽），断言 `cf=256 < cf=0 × 0.5`。
 2. 采样增强：速度分层 + "最近根音"音区选择、WAV 8/24bit 支持、采样库清单扫描（`/synth/*.ins` 列表）。
-3. 硬件侧（需要人）：按 `docs/cubemx-checklist.md` 生成 CubeMX 驱动 → 把 `Synth/port/synth_port_config.h` 的
-   SAI 句柄名对齐（默认 `hsai3`）→ 接 CMake 片段（含 TinyUSB 的 `tinyusb_target_add` + `dcd_dwc2.c`）
-   → 真机验证 QSPI 采样（放开 MPU 对 `0x90000000` 的 NO_ACCESS）、DMA/Cache 一致性、CPU 负载与 xrun 计数。
+3. ~~硬件侧接入（句柄名/CMake/MPU/main.c）~~ → **已完成（2026-10-18）**，见 [phase2-review.md](phase2-review.md)：
+   `Core/Src/main.c` 已重构（SAI3 时钟走 PLL2、32bit、DMA 兜底、MPU 放开 `0x90000000`、启动序列与故障位图），
+   `Synth/port/synth_port_config.h` 句柄名已对齐 `hsai_BlockB3`，根 `CMakeLists.txt` 已接引擎 + TinyUSB，
+   链接脚本已加 `.ram_section`。**实测 72/72 源文件编译通过、链接成功**。
+   CubeMX 侧同类项也已完成：`.ioc` 里 SAI3 = 32bit + DMA1_Stream0 循环 WORD + NVIC 0、SAI23 时钟源 = PLL2
+   （M5/N108/FRACN1101/P22 = 24.57599987 MHz）、QUADSPI 参数（48 MHz / FlashSize 23 / HALF_CYCLE / CS 3 cycle）、
+   SDMMC1 + FATFS、PD4 卡检测上拉、PLL1Q = 20（USB 48 MHz）、CODE_PAGE 850 + LFN（静态缓冲）。
+4. **应用集成收尾已完成（2026-10-18 晚）**：
+   - `main()` 手写在 `Core/Src/main.c` 的 `USER CODE 4`（`.ioc` 勾了 "Do not generate the main()"），
+     含 `MPU_Config() → 时钟 → App_ZeroDtcmBss() → MX_*_Init() → 音频 → QSPI 内存映射 → 引擎 → 主循环`。
+   - **QSPI 进内存映射**：`App_QspiEnterMemoryMapped()`（复位 + JEDEC ID 自检 + QE 置位 + `0xEB` 四线快读
+     + `HAL_QSPI_MemoryMapped()`）；`g_app_status.qspi_id` 应为 `0xEF4017`。
+   - **内存策略调整**：`.data/.bss` 默认搬到 AXI SRAM，DTCM 只留栈/堆 + `SYNTH_HOT` 热点表
+     （正弦表 4 KB + 波表 32 KB 已搬进 `.dtcm_bss`，由 `App_ZeroDtcmBss()` 清零）。
+   - 实测（RelWithDebInfo，SD 关闭）：FLASH 92,168 B (70.3%)、DTCM 46,336 B (35.4%)、AXI 247,548 B (47.2%)；
+     `SYNTH_PORT_SD_ENABLE=1` 时 FLASH 109,532 B (83.6%)、AXI 392,576 B (74.9%)。
+    - **USB 板级初始化补了一处必需项**：`Synth/port/platform_stm32.c` 的 `usb_hw_init()` 现在第一句是
+      `HAL_PWREx_EnableUSBVoltageDetector()`。H7 的 FS PHY 由 VDD33USB 供电，电平检测器不开时 DP 上拉
+      不生效 → 主机侧完全看不到设备（连"未知 USB 设备"都不出现）。CubeMX 为同一块板生成的
+      `HAL_PCD_MspInit()` 第一句就是它；TinyUSB 的 dwc2 驱动不管 PWR。
+    - **USB 诊断**：`g_app_status` 增到 **28 个 u32** —— 除 `usb_mounted` = `tud_mounted()`、
+      `midi_rx_bytes` 之外，还有 `boot_count` / `reset_flags`（判断**复位循环**：HardFault 钩子是
+      `NVIC_SystemReset()`，肉眼只看得到"枚举失败"；⚠ 烧写和按复位键都会让 `boot_count` +1，
+      要「不烧写不复位连读两次看是否增长」）、`usb_mount_count` / `usb_umount_count`（枚举/掉线次数），
+      以及第三轮加的 USB 寄存器快照 `usb_irq_count`（OTG_FS 中断次数，恒为 0 = 核没中断）、
+      `usb_dctl` / `usb_dsts` / `usb_gotgctl` / `usb_gintsts` / `usb_gccfg` / `usb_gusbcfg` / `usb_dcfg`、
+      `usb_sel` / `usb_clk_rc`、`loop_count`（不涨 = 主循环卡死）。主循环里刷新。
+      ⚠ `usb_ck_hz` 不能用 `HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_USB)` —— H7 的 HAL 里
+      **没有 USB 分支**（`stm32h7xx_hal_rcc_ex.c:1881` 起），恒返回 0；现已改为按 mux + PLL1Q 自算。
+    - **PE3 心跳灯**（`App_LedTask`，不接调试器也能看状态）：100 ms 快闪 = 有故障位；
+      1 Hz 慢闪 = 主循环在跑但 USB 未枚举；每 2 秒一次短脉冲 = 一切正常。
+    - **一条命令看状态**：`tools/status.ps1`（VS Code 任务"读取板子状态"）——自己从 ELF 里查
+      `g_app_status` 地址（重编译不会失效），openocd 读回后解码成表，附故障位、复位原因和结论。
+      排查顺序见 `docs/phase2-review.md` 第 7 节第 6 条。
+    - **HardFault 现场记录**（2026-10-18 晚）：`HardFault_Handler` 先调 `App_HardFaultRecord()`
+      （`Core/Src/main.c`，`naked` + 内联汇编、不压栈），把现场写进 `g_fault`
+      （**20 个 u32**，在 `.ram_section`，软复位不丢；本次构建地址 `0x2400BF00`）：
+      `count/CFSR/HFSR/MMFAR/BFAR/ICSR/EXC_RETURN/MSP/PSP` + `r0-r3/r12/LR/PC/xPSR`；
+      存完**不复位**，PE3 改为**三短一长**循环闪。背景：调试器里单步不炸、放它自己全速跑必炸
+      ⇒ 故障几乎肯定在中断上下文（首选嫌疑：音频 DMA1_Stream0，优先级 0）。
+      `tools/status.ps1` 已能解码这一段（CFSR 逐位、犯规地址、出事时的异常号、PC/LR 源码行）。
+   - **构建/下载脚本**：`tools/build.ps1`（`-BuildType/-Generator/-BuildDir/-Clean/-Flash/-NoSize`）、
+     `tools/flash.ps1`（OpenOCD + CMSIS-DAP，自动挑最新的 `STM32synthesizer.elf`，`-DryRun` 只打印命令）、
+     `.vscode/tasks.json`（六个任务）、`CMakePresets.json`（四组预设，**务必带 toolchainFile**）。
+     ⚠ 两个 .ps1 必须保持 **UTF-8 BOM**：PowerShell 5.1 会把无 BOM 的 UTF-8 当 GBK 读，中文注释乱码后
+     整个脚本报 `Unexpected token`。
+5. **仍需做**：
+   - ⚠ 启用 SD（`Synth/port/synth_port_config.h` 的 `SYNTH_PORT_SD_ENABLE` 置 1）之前，先解决
+     SDMMC 内部 IDMA 与 D-Cache 的一致性（FATFS 对象/采样池目前是可缓存的 AXI SRAM）。
+     SD 路径本身已能编译+链接（顺手修掉两个藏在开关后面的 bug：`patch_storage_sd.c` 少了
+     `synth_port.h` 导致 `synth_port_instrument_load` 隐式声明、`sample_storage_sd.c` 还在用旧宏名
+     `SYNTH_SAMPLE_POOL_BYTES`），采样池默认已从 256 KB 降到 128 KB（256 KB 时 AXI 99.88%）。
+   - 真机验证：DMA/Cache 一致性、CPU 负载与 xrun 计数、QSPI 采样读取（dummy cycles 若错位改 6）。
+   - 采样增强：速度分层 + "最近根音"音区选择、WAV 8/24bit 支持、采样库清单扫描（`/synth/*.ins` 列表）。
 
 ## 6. 踩过的坑（别重复踩）
 - msfa：必须先调 `Exp2/Tanh/Sin/Freqlut/Env/PitchEnv/Porta/Lfo` 的 init，否则空表指针 → 0xC0000005；
@@ -74,5 +129,14 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
 - 测量缓冲隔点写入 = 插零 → 频率读数减半；std::vector 越界 → STATUS_HEAP_CORRUPTION。
 - C++ 成员函数名会遮蔽同名嵌套类型（`Held()` vs `struct Held`）。
 - git 直连走不可用代理 → `git -c http.proxy= -c https.proxy= clone`。
-- **compress 工具在本会话永久失效**（折叠基线代际错位，见 `acp_status` 的 FOLD BASE GENERATION MISMATCH）；
-  解决办法是开新会话，而本文件就是为了让新会话能无缝接手。
+- **compress 工具在旧会话里曾永久失效**（折叠基线代际错位，见 `acp_status` 的 FOLD BASE GENERATION MISMATCH）；
+  解决办法是开新会话，而本文件就是为了让新会话能无缝接手。（2026-10-18 的新会话里 compress 已恢复正常。）
+- **TinyUSB 本地补丁（升级库时必须重打）**：`tu_edpt_packet_size()`
+  （`Synth/third_party/tinyusb/src/common/tusb_types.h`）改成 `volatile` 逐字节读 `wMaxPacketSize`。
+  USB-MIDI 描述符的端点落在奇数地址，`ldrh` 在 Cortex-M7 上非对齐访问 → UsageFault → HardFault，
+  正好死在 `SET_CONFIGURATION`，表现是 Windows 代码 10、固件 `usb_mounted = 0`。详见
+  `docs/phase2-review.md` §8。
+- **`arm-none-eabi-nm -S` 的分列**是 `地址 大小 类型 名字`：取地址用 `(\$line -split '\s+')[0]`
+  （用 `[1]` 会读到大小 → dump 到垃圾地址）。
+- **openocd 的 `mdw`/`echo` 输出经 PowerShell 捕获会丢**（只有 stderr 的 Info/Error 能看到）：
+  读内存一律 `dump_image {文件} 0x地址 长度` 再用 `[BitConverter]::ToUInt32` 解。

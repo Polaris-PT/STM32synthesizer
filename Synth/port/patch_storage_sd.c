@@ -1,14 +1,25 @@
-/* SD 卡音色存储：/synth/NNN.syn（0:/synth）。2
-   仅在主循环调用（FATFS 不可重入、不可在音频中断里使用）。 */
+/* SD 卡音色存储：/synth/NNN.syn（0:/synth）。
+   仅在主循环调用（FATFS 不可重入、不可在音频中断里使用）。
+   CubeMX 里还没启用 FatFs 时（SYNTH_PORT_SD_ENABLE=0）退化为空实现，保证工程可编译。 */
 #include "synth_port_config.h"
+#include "synth_port.h"      /* synth_port_instrument_load() 的声明（实现在 sample_storage_sd.c） */
 #include "synth/synth.h"
-#include "../src/app/patch_text.h"
 
+#if SYNTH_PORT_SD_ENABLE
+
+#include "../src/app/patch_text.h"
 #include "ff.h"
 #include <string.h>
 #include <stdio.h>
 
-static FATFS       g_fs;
+/* FATFS 对象（含 512B 的 fs->win 扇区窗口，f_read/f_write 的数据都从这里过）必须在
+   AXI SRAM：SDMMC 走芯片内部 IDMA，HAL 把调用方的指针直接写进 SDMMC_IDMABASE0
+   （Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_sd.c:1288），而 IDMA 挂在 AXI 上、
+   **访问不到 DTCM**（0x20000000）—— 链接脚本默认把 .bss 放 DTCM，所以这里显式指定段。
+   注意：这一段仍是 D-Cache 可缓存的（默认内存映射），所以启用 SD（SYNTH_PORT_SD_ENABLE=1）
+   之前还要处理 cache 一致性：要么给 FATFS 对象单独一个非缓存 MPU region，要么在
+   diskio 读写前后做 SCB_CleanInvalidateDCache_by_Addr。见 docs/phase2-review.md 的待办。 */
+static FATFS SYNTH_PORT_AUDIO_RAM g_fs;
 static int         g_mounted = 0;
 static FIL         g_file;
 static char        g_text[SYNTH_PORT_PATCH_MAXLEN];
@@ -76,3 +87,14 @@ int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
     f_close(&g_file);
     return (fr == FR_OK && wrote == (UINT)len) ? 0 : -4;
 }
+
+#else /* !SYNTH_PORT_SD_ENABLE —— 未启用 FatFs：全部退化为“无卡”行为 */
+
+int synth_port_sd_mount(void) { return -1; }
+void synth_port_patch_service(void) { }
+int synth_port_patch_load_file(const char *path) { (void)path; return -1; }
+int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
+    (void)index; (void)p; return -1;
+}
+
+#endif /* SYNTH_PORT_SD_ENABLE */

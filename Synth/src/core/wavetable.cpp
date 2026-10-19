@@ -2,7 +2,9 @@
 
 namespace ssynth {
 
-float  WaveTables::storage_[(int)WtShape::kCount * WaveTables::kSumSizes];
+/* 32KB 波表本体：每个振荡器采样都要读 → 放 DTCM（SYNTH_HOT 定义见 dsp_util.h）。
+   运行期由 Build() 填充（Init 时统一构建），所以放 NOLOAD 段是安全的。 */
+float  WaveTables::storage_[(int)WtShape::kCount * WaveTables::kSumSizes] SYNTH_HOT;
 float *WaveTables::tables_[(int)WtShape::kCount][kWtMips];
 bool   WaveTables::ready_ = false;
 

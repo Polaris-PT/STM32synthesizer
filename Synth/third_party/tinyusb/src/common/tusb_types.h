@@ -567,7 +567,20 @@ TU_ATTR_ALWAYS_INLINE static inline uint8_t tu_edpt_addr(uint8_t num, uint8_t di
 }
 
 TU_ATTR_ALWAYS_INLINE static inline uint16_t tu_edpt_packet_size(tusb_desc_endpoint_t const* desc_ep) {
-  return tu_le16toh(desc_ep->wMaxPacketSize) & 0x7FF;
+  // 【本地补丁，勿随库更新覆盖】USB-MIDI 的配置描述符里，端点描述符可能落在**奇数偏移**：
+  // 我们的 TUD_MIDI_DESCRIPTOR 展开后 MIDIStreaming 头是 65 字节，wTotalLength = 101 是奇数，
+  // 于是 EP OUT 描述符在 +0x49、EP IN 在 +0x5F。而 Cortex-M7 的 LDRH/STRH **不支持非对齐访问**
+  // （只有字的 LDR/STR 可以），原来那句 `tu_le16toh(desc_ep->wMaxPacketSize)` 会编成
+  // `ldrh r3,[r1,#4]`，地址为奇数时触发 UsageFault(UNALIGNED, CFSR bit24) → 升级成 HardFault。
+  // 现象：主机发 SET_CONFIGURATION 时板子死机，Windows 报「该设备无法启动（代码 10）/
+  // I/O 请求已取消」；单步调试不炸，是因为 CPU 停住后主机等不到配置阶段。
+  // 改成逐字节读，彻底避开半字访问。
+  // 注意：**必须加 volatile** —— 否则 -O2 会把 `p[0] | p[1]<<8` 又合并回一条 `ldrh`
+  // （GCC 知道目标允许非对齐访问时就这么干；可是 Cortex-M7 的 LDRH 并不支持非对齐，
+  //   于是补丁等于白打。实测：不加 volatile 时反汇编仍是 ldrh r3,[r1,#4]）。
+  volatile const uint8_t* p = (volatile const uint8_t*) &desc_ep->wMaxPacketSize;
+  uint16_t const v = (uint16_t) ((uint16_t) p[0] | ((uint16_t) p[1] << 8));
+  return tu_le16toh(v) & 0x7FF;
 }
 
 #if CFG_TUSB_DEBUG

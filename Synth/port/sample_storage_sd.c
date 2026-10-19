@@ -5,16 +5,15 @@
 #include "synth_port.h"
 #include "synth/synth.h"
 
+#if SYNTH_PORT_SD_ENABLE
+
 #include "ff.h"
 #include "../src/app/instrument_text.h"
 #include <string.h>
 
-/* 采样池：放 AXI SRAM（.ram_section），512KB 供 ROMpler 使用 */
-#ifndef SYNTH_SAMPLE_POOL_BYTES
-#define SYNTH_SAMPLE_POOL_BYTES (512u * 1024u)
-#endif
-
-static int16_t SYNTH_PORT_AUDIO_RAM g_sample_pool[SYNTH_SAMPLE_POOL_BYTES / 2u];
+/* 采样池：放 AXI SRAM（.ram_section），大小由 synth_port_config.h 的
+   SYNTH_PORT_SAMPLE_POOL_BYTES 决定（那里有整个 AXI SRAM 的分配账）。 */
+static int16_t SYNTH_PORT_AUDIO_RAM g_sample_pool[SYNTH_PORT_SAMPLE_POOL_BYTES / 2u];
 static uint32_t g_pool_used = 0u;
 
 static FIL g_wav_file;
@@ -27,7 +26,7 @@ void synth_port_sample_pool_reset(void) {
 }
 
 uint32_t synth_port_sample_pool_used(void) { return g_pool_used; }
-uint32_t synth_port_sample_pool_size(void) { return SYNTH_SAMPLE_POOL_BYTES; }
+uint32_t synth_port_sample_pool_size(void) { return SYNTH_PORT_SAMPLE_POOL_BYTES; }
 
 static uint32_t rd_u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint16_t rd_u16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
@@ -103,7 +102,7 @@ int synth_port_sample_load_wav(const char *path, uint8_t root, uint8_t low, uint
 
     const uint32_t frames = data_bytes / (2u * channels);
     const uint32_t bytes_needed = frames * 2u;
-    if (g_pool_used + bytes_needed > SYNTH_SAMPLE_POOL_BYTES) { f_close(&g_wav_file); return -8; }
+    if (g_pool_used + bytes_needed > SYNTH_PORT_SAMPLE_POOL_BYTES) { f_close(&g_wav_file); return -8; }
     if (g_instrument.zone_count >= SYNTH_ROM_MAX_ZONES) { f_close(&g_wav_file); return -9; }
 
     int16_t *dst = &g_sample_pool[g_pool_used / 2u];
@@ -168,3 +167,22 @@ void synth_port_sample_activate(void) {
     synth_set_sample_instrument(&g_instrument);
     synth_set_engine_type(2u);
 }
+
+#else /* !SYNTH_PORT_SD_ENABLE —— 未启用 FatFs：采样池与 .ins 载入都不可用 */
+
+void synth_port_sample_pool_reset(void) { }
+uint32_t synth_port_sample_pool_used(void) { return 0u; }
+uint32_t synth_port_sample_pool_size(void) { return 0u; }
+
+int synth_port_sample_load_wav(const char *path, uint8_t root, uint8_t low, uint8_t high,
+                               uint8_t loop, uint32_t loop_start, uint32_t loop_end) {
+    (void)path; (void)root; (void)low; (void)high;
+    (void)loop; (void)loop_start; (void)loop_end;
+    return -1;
+}
+
+void synth_port_sample_activate(void) { }
+
+int synth_port_instrument_load(const char *path) { (void)path; return -1; }
+
+#endif /* SYNTH_PORT_SD_ENABLE */
