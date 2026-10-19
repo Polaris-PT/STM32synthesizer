@@ -32,7 +32,7 @@ extern SAI_HandleTypeDef hsai_BlockB3;
    ② AXI SRAM 放得下采样池（默认 512KB 池会和 FX 192KB 一起超出 512KB，
    见下面 SYNTH_PORT_SAMPLE_POOL_BYTES 的说明）。 */
 #ifndef SYNTH_PORT_SD_ENABLE
-#define SYNTH_PORT_SD_ENABLE    0
+#define SYNTH_PORT_SD_ENABLE    1
 #endif
 
 /* --- ROMpler 采样池（.ram_section，AXI SRAM）---
@@ -56,9 +56,19 @@ extern SAI_HandleTypeDef hsai_BlockB3;
 #endif
 #define SYNTH_PORT_DEBUG_BAUD   115200u   /* 仅作记录：实际波特率由 usart.c 决定 */
 
-/* 每个 USB-MIDI 事件包打一行（判断 note-off 有没有到；嫌吵/嫌慢改 0） */
+/* 每个 USB-MIDI 事件包打一行（判断 note-off 有没有到）。默认关：115200 下每包一行会明显
+   拖慢串口，只在查"音停不下来"这类问题时才置 1。 */
 #ifndef SYNTH_PORT_MIDI_TRACE
-#define SYNTH_PORT_MIDI_TRACE   1
+#define SYNTH_PORT_MIDI_TRACE   0
+#endif
+
+/* --- HardFault 之后怎么办 ---
+   0（默认）= 记录现场 + 串口打一行 + PE3 "三短一长"循环闪，**不复位**：现场留在 g_fault
+              （.ram_section），用 tools\status.ps1 读得到；接着挂调试器排查也方便。
+   1 = 记录完现场后软复位（g_fault 在 .ram_section，复位不丢），板子自动恢复发声 ——
+       当作乐器用、不想插调试器时选它。 */
+#ifndef SYNTH_PORT_FAULT_RESET
+#define SYNTH_PORT_FAULT_RESET  0
 #endif
 
 #endif /* SYNTH_PORT_CONFIG_H */

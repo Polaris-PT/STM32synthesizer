@@ -45,6 +45,15 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+# 〔LTO 已试过并放弃，这里留个记录，别再踩一遍〕
+# -flto 在这套代码上能省 ~4 KB（116,172 B vs 120,072 B），但**与 HAL 的弱符号覆盖模式冲突**：
+# HAL 里 `HAL_*_MspInit()` 是 `__weak` 空实现，我们的强定义在 Core/Src/*.c。整程序 LTO 时
+# GCC 会让库里那个弱版本"胜出"，我们的 MspInit 被丢掉 —— ELF 里 `HAL_SAI_MspInit` 符号整个
+# 消失，实机现象是 SAI/QSPI/SD 全没配（fault = 0x126、没声音、QSPI 映射失败）。
+# 给 HAL 库加 -fno-lto 能修好弱符号，但省下来的就只剩 ~144 B（119,928 B），不值得；
+# 给 Core/Src 加 -fno-lto 无效（目标级 -flto 在命令行上排得更靠后）。
+# 结论：不提供 LTO 开关，发布版用 SYNTH_RELEASE + 冷路径 -Os（120,072 B / 91.61%）就够。
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 
@@ -81,10 +90,70 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/Synth/third_party/tinyusb/src"
 )
 
-# 引擎必须 -O2（48kHz、128 帧/块，每块 ~2.6ms 的预算）；不要开 -ffast-math。
-set_source_files_properties(${SYNTH_ENGINE_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
-# 端口层回调（SAI 半传输/完成中断里的渲染调用）也在实时路径上
-set_source_files_properties(${SYNTH_PORT_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+# 引擎与端口层的实时预算：48 kHz、128 帧/块 = 2.667 ms（480 MHz 下 1.28M 周期）。
+# 2026-10-19 实测（16 声部、出厂音色 1，板上 cpu_permille）：
+#   -O2 默认                        → 2121‰（还带 tanf/exp2f 控制率浪费）
+#   控制率 8→32、噪声/子振按需计算   → 1450‰
+#   -O3 + -ffast-math（下面这条）    → 见 docs/phase2-review.md §9
+# -ffast-math 对音频可以接受：省掉了 denormal 处理与 errno 分支，
+# 引擎里没有需要 IEEE 边角语义（NaN/±0/inf）的算法。
+set_source_files_properties(${SYNTH_ENGINE_SOURCES} ${SYNTH_PORT_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "-O3;-ffast-math;-fno-math-errno")
+
+# ---------------------------------------------------------------------------
+# FatFs / SD 驱动不在实时路径上 → 用 -Os 编译，把 flash 留给合成器。
+# 背景：H750 只有 128 KB flash。打开 SD（SYNTH_PORT_SD_ENABLE=1）后 FatFs + SDMMC
+# HAL 约 +18 KB，2026-10-19 曾把 .rodata 挤出 FLASH 2,616 B。本文件 CubeMX 只生成一次
+# （重新生成不会覆盖），而 cmake/stm32cubemx/CMakeLists.txt 每次都会被重写，
+# 所以与尺寸有关的编译开关放在这里。
+# ---------------------------------------------------------------------------
+target_compile_options(FatFs PRIVATE -Os)
+target_compile_options(STM32_Drivers PRIVATE -Os)
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/App/fatfs.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/bsp_driver_sd.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/sd_diskio.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/fatfs_platform.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sdmmc.c"
+    PROPERTIES COMPILE_OPTIONS "-Os"
+)
+
+# ---------------------------------------------------------------------------
+# 发布构建裁剪（2026-10-19）：H750 只有 128 KB flash，诊断代码（串口日志 + 现场打印）
+# 是最大的一块可变开销。打开这个开关后：
+#   - Synth/port/debug_uart.c 编译为空
+#   - main.c 与端口层里的 dbg_log() 变成空宏 → 诊断字符串 + vsnprintf 都不再链进固件
+#   - HardFault 的串口现场打印去掉（现场照旧写进 g_fault，tools\status.ps1 读得到）
+# 保留：HardFault 记录、存活探针、PE3 心跳灯、g_app_status（合计几十字节，是排查的唯一手段）。
+# 用法：cmake -DSYNTH_RELEASE=ON …（或 tools\build.ps1 传 -DSYNTH_RELEASE=ON，见脚本说明）
+# ---------------------------------------------------------------------------
+option(SYNTH_RELEASE "裁剪诊断代码（关调试串口日志）" OFF)
+if(SYNTH_RELEASE)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE SYNTH_PORT_DEBUG_UART=0)
+    message(STATUS "SYNTH_RELEASE=ON：调试串口日志已关闭（诊断字符串不再进 flash）")
+endif()
+
+# 非热路径用 -Os：CubeMX 应用源 + "冷"端口层文件（DSP 热路径与音频 ISR 仍是 -O3）。
+# audio_out_sai.c 故意不在此列：它的 DMA 回调在优先级 0 的中断里跑。
+set(SYNTH_CUBEMX_APP_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/main.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/stm32h7xx_it.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/stm32h7xx_hal_msp.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/gpio.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/dma.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/usart.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/quadspi.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sai.c")
+set_source_files_properties(${SYNTH_CUBEMX_APP_SOURCES} PROPERTIES COMPILE_OPTIONS "-Os")
+
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/platform_stm32.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/usb_midi_tinyusb.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/patch_storage_sd.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/sample_storage_sd.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/sample_storage_qspi.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/debug_uart.c"
+    PROPERTIES COMPILE_OPTIONS "-Os")
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
@@ -106,6 +175,17 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "${TINYUSB_SRC}/class/midi/midi_device.c"
     "${TINYUSB_SRC}/portable/synopsys/dwc2/dcd_dwc2.c"
     "${TINYUSB_SRC}/portable/synopsys/dwc2/dwc2_common.c"
+)
+
+# TinyUSB 也不在实时路径上（重型工作在 tud_task()，主循环里）→ -Os 省 flash
+set_source_files_properties(
+    "${TINYUSB_SRC}/tusb.c"
+    "${TINYUSB_SRC}/common/tusb_fifo.c"
+    "${TINYUSB_SRC}/device/usbd.c"
+    "${TINYUSB_SRC}/class/midi/midi_device.c"
+    "${TINYUSB_SRC}/portable/synopsys/dwc2/dcd_dwc2.c"
+    "${TINYUSB_SRC}/portable/synopsys/dwc2/dwc2_common.c"
+    PROPERTIES COMPILE_OPTIONS "-Os"
 )
 
 # Remove wrong libob.a library dependency when using cpp files

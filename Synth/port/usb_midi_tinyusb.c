@@ -1,16 +1,13 @@
-/* USB MIDI（TinyUSB，dwc2）→ synth_midi_in()
+/* USB MIDI（TinyUSB，dwc2 驱动）→ synth_midi_in()
  *
- * 依赖：把 TinyUSB 源码放到 Synth/third_party/tinyusb（见 Synth/port/README.md），
- *      并把 tinyusb/src 加入 include 路径、把 src 下所有 .c 与 src/class/midi 下所有 .c
- *      和 src/portable/synopsys/dwc2 下所有 .c 加入编译。
+ * 依赖：TinyUSB 源码在 Synth/third_party/tinyusb（见 Synth/port/README.md），构建时加入
+ *   tusb.c / tusb_fifo.c / usbd.c / midi_device.c / dcd_dwc2.c / dwc2_common.c 六个文件。
+ *   已按 vendored 版本（commit 3c6524e）核对 API：tud_midi_n_available(itf, cable)、
+ *   tud_midi_n_packet_read(itf, pkt[4])、tud_midi_rx_cb(itf)、TUD_MIDI_DESCRIPTOR(...)。
  *
- * 已按 vendored 版本（commit 3c6524e）核对 API：
- *   tud_midi_n_available(itf, cable) / tud_midi_n_packet_read(itf, pkt[4]) /
- *   tud_midi_rx_cb(itf) / TUD_MIDI_DESCRIPTOR(itf, stridx, ep_out, ep_in, epsize)
- *
- * 注意：CubeMX 里不要启用 ST 的 USB Device 中间件（HAL_PCD/ll_usb），
- *      由 TinyUSB 的 dwc2 驱动直接接管 OTG_FS；OTG_FS_IRQHandler 里调用
- *      tud_int_handler(0)（旧版为 dcd_int_handler(0)，见下发文件实际符号）。
+ * 注意：CubeMX 里不要启用 ST 的 USB Device 中间件（HAL_PCD/ll_usb），由 TinyUSB 的 dwc2
+ *   驱动直接接管 OTG_FS；OTG_FS_IRQHandler 里调 tud_int_handler(0)（在 stm32h7xx_it.c 的
+ *   USER CODE 区）。
  */
 #include "synth_port_config.h"
 #include "synth_port.h"
@@ -47,13 +44,10 @@ void tud_umount_cb(void) {
 #define EPNUM_MIDI_OUT 0x01
 #define EPNUM_MIDI_IN  0x81
 
-/* MIDI 描述符集里有【两个】接口：0 = AudioControl，1 = MIDIStreaming
- * （TUD_MIDI_DESCRIPTOR(n, …) 内部把 MIDIStreaming 放在 n+1，AudioControl 头里的
- *  baInterfaceNr 也指向 n+1）。所以 bNumInterfaces 必须是 2。
- * 写成 1 时配置描述符自相矛盾：Windows 读得出设备名（枚举前半段成功、设备管理器里
- * 能看到 "H750 PCM5102A Synth"），但 usbmidi.sys 启动失败 →
- * "该设备无法启动。(代码 10) I/O 设备的设置不正确或驱动程序的配置参数不正确"，
- * 并且不会创建 MIDI 端口（DAW 里看不到设备）。 */
+/* MIDI 描述符集含【两个】接口：0 = AudioControl、1 = MIDIStreaming（TUD_MIDI_DESCRIPTOR(n,…)
+ * 把 MIDIStreaming 放在 n+1，AudioControl 头的 baInterfaceNr 也指向 n+1）→ bNumInterfaces 必须是 2。
+ * 写成 1 时配置描述符自相矛盾：Windows 能看到设备名，但 usbmidi.sys 启动失败（代码 10），
+ * 且不创建 MIDI 端口。 */
 #define ITF_NUM_MIDI            0
 #define ITF_NUM_MIDI_STREAMING  1
 #define ITF_NUM_TOTAL           2
@@ -137,9 +131,9 @@ void tud_midi_rx_cb(uint8_t itf) {
     }
 }
 
-/* OTG_FS 中断计数：在 Core/Src/stm32h7xx_it.c 的 OTG_FS_IRQHandler() 里 ++。
-   诊断价值：插着 USB 线却恒为 0 → DWC2 核根本没产生中断（内核时钟/PHY 供电/DP 上拉/
-   中断使能的问题），而不是"枚举谈不拢"。主循环抄进 g_app_status.usb_irq_count。 */
+/* OTG_FS 中断计数（在 Core/Src/stm32h7xx_it.c 的 OTG_FS_IRQHandler 里 ++）。
+   插着线却恒为 0 = DWC2 核没产生中断（时钟/PHY 供电/DP 上拉/中断使能的问题），
+   而不是"枚举谈不拢"。主循环抄进 g_app_status.usb_irq_count。 */
 volatile uint32_t g_synth_usb_irq_count = 0;
 
 /* ---------- 端口 API ---------- */

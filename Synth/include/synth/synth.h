@@ -63,6 +63,13 @@ void     synth_panic(void);                        /* 立即静音（保留参�
 int      synth_set_patch(uint16_t index);
 int      synth_set_patch_ptr(const synth_patch_t *patch);   /* 例如从 SD 加载后 */
 uint16_t synth_get_patch_index(void);
+
+/* 多音色（按通道映射）：channel = 0..15，index = 音色库里的一条
+   （0 = Init Saw … 14 = FM Bell）。符合 GM 的用法是让 Program Change 消息
+   自己带通道来切（引擎已这样做），这两个函数留给"开机预置/上位机直控"。
+   注意：全局效果链（合唱/延迟/过载）跟随"最后一次切换到的音色"。 */
+int      synth_set_channel_patch(uint8_t channel, uint16_t index);
+uint16_t synth_get_channel_patch(uint8_t channel);          /* 0xFFFF = 未知/越界 */
 void     synth_note_on(uint8_t note, uint8_t velocity);
 void     synth_note_off(uint8_t note);
 void     synth_set_channel_filter(int8_t channel);/* -1 = 全部通道（默认） */

@@ -4,23 +4,32 @@
   * @file           : main.c
   * @brief          : H750VBT6 合成器主程序（CubeMX 生成骨架 + 应用层集成）
   ******************************************************************************
-  * 板级约定（与 docs/cubemx-checklist.md 对应）：
-  *   SYSCLK   = 480 MHz（PLL1: M=5 N=192 P=2, VOS0 + FLASH_LATENCY_4）
+  * 板级约定（详见 docs/cubemx-checklist.md、docs/code-map.md）：
+  *   SYSCLK   = 480 MHz（PLL1: M=5 N=192 P=2，VOS0 + FLASH_LATENCY_4）
   *   HCLK     = 240 MHz（AHB DIV2）
-  *   USB 时钟 = PLL1Q = 48.000 MHz  ← .ioc 里 DIVQ1 = 20，CubeMX 生成的 PLLQ 也是 20，
-  *                                    重新生成会保持（OTG_FS 要的 48 MHz 由此而来）
-  *   音频时钟 = PLL2P = 24.576 MHz  ← CubeMX 已配（PLL2: M=5 N=108 FRACN=1101 P=22，
-  *                                    写在 Core/Src/sai.c 的 HAL_SAI_MspInit 里）
-  *                                   MCKDIV = 2 → MCLK 12.288 MHz = 256×fs → 48.000 kHz
+  *   USB 时钟  = PLL1Q = 48.000 MHz（.ioc 里 DIVQ1 = 20，CubeMX 生成的 PLLQ 也是 20，
+  *                                    重新生成会保持）
+  *   音频时钟  = PLL2P = 24.576 MHz（PLL2: M=5 N=108 FRACN=1101 P=22，写在 Core/Src/sai.c
+  *                                    的 HAL_SAI_MspInit 里）→ MCKDIV = 2 → MCLK 12.288 MHz
+  *                                    = 256×fs → 48.000 kHz
   *
-  * 分工（CubeMX 重新生成 main.c 时会覆盖「生成区」，原样保留 USER CODE 区）：
-  *   .ioc / sai.c / dma.c / sdmmc.c → 时钟树、SAI 格式、DMA、SDMMC、FATFS（都在 CubeMX 里配）
-  *   SystemClock_Config()（生成区）  → PLL1（含 Q = 20）+ 总线时钟
-  *   MPU_Config()（生成区）          → Region0 0x0/4GB NO_ACCESS、Region1 内部 flash 只读、
-  *                                     Region2 QSPI 窗口 0x90000000/8MB 非缓存只读
-  *   USER CODE 区（本文件）          → main()、QSPI 进内存映射、MCLK/GPIO 补丁、自检、
-  *                                     .dtcm_bss 清零
-  *   Synth/port/                     → 引擎胶水层（D-Cache/DWT/USB/SAI DMA/FATFS 读写）
+  * 分工（CubeMX 重新生成 main.c 会覆盖「生成区」，原样保留 USER CODE 区）：
+  *   .ioc / sai.c / dma.c / sdmmc.c / usart.c → 时钟树、SAI 格式、DMA、SDMMC、FATFS、串口
+  *   SystemClock_Config() / MPU_Config()      → 生成区（PLL1、总线时钟、MPU Region0/1/2）
+  *   本文件的 USER CODE 区                     → main()、QSPI 进内存映射、MCLK/GPIO 补丁、自检、
+  *                                              .dtcm_bss 清零、诊断探针
+  *   Synth/port/                              → 引擎胶水层（D-Cache/DWT/USB/SAI DMA/SD/串口）
+  *
+  * 诊断代码清单（**可整体删除**，删掉后固件只剩功能代码；各项互不依赖，可逐项删）：
+  *   ① g_app_status（32 字）  启动/运行状态快照，用 tools/status.ps1 读；主循环刷新
+  *   ② g_fault（20 字）       HardFault 现场：App_HardFaultRecord* + App_FindFaultFrame + 闪灯
+  *   ③ PE3 心跳灯             App_LedInit/App_LedTask（快闪=故障、1 Hz=USB 未枚举、2 s 脉冲=正常）
+  *   ④ 存活探针               systick_ticks / loop_count / main_stage / usb_isr_depth / audio_isr_depth
+  *   ⑤ USB 寄存器快照         App_SnapshotUsb（仅在未枚举时刷新）
+  *   ⑥ 时钟自检               App_CheckSaiClock / App_UsbKernelClockHz
+  *   ⑦ 串口日志               Synth/port/debug_uart.[ch] + 各处 dbg_log（开关 SYNTH_PORT_DEBUG_UART）
+  *   ⑧ USB-MIDI 逐包打印      开关 SYNTH_PORT_MIDI_TRACE（默认 0）
+  *   删 ①-⑥ 时把 main() / 主循环里对应的调用一并删掉即可。
   ******************************************************************************
   * @attention
   *
@@ -60,7 +69,7 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-/* 上板诊断状态：调试器里看 g_app_status 即可定位问题（无需串口） */
+/* 上板诊断状态：调试器 / tools/status.ps1 读 g_app_status 即可定位问题（不接串口也行） */
 typedef struct {
   uint32_t sysclk_hz;    /* SystemCoreClock（应为 480000000） */
   uint32_t hclk_hz;      /* HAL_RCC_GetHCLKFreq()（应为 240000000） */
@@ -75,20 +84,18 @@ typedef struct {
   int32_t  audio_start;  /* synth_port_audio_start() 返回值（-1 = DMA 没起来） */
   uint32_t usb_mounted;  /* tud_mounted()：1 = 主机已完成枚举（Windows 里就能看到设备） */
   uint32_t midi_rx_bytes;/* USB-MIDI 收到的字节数（弹个键就涨；不涨 = 主机没发数据） */
-  uint32_t boot_count;   /* 启动次数：软复位不清零（变量放在 .ram_section，只有断电才丢）。
-                            持续增长 = 固件在复位循环（HardFault 钩子会 NVIC_SystemReset） */
-  uint32_t reset_flags;  /* 上一次复位原因的原始快照（RCC->RSR，读过即清）：位定义见
-                            stm32h750xx.h 里的 RCC_RSR_*（PORRSTF/PINRSTF/BORRSTF/SFTRSTF/
-                            WWDGRSTF/IWDGRSTF/LPWRRSTF）—— 用它们区分上电/复位键/看门狗/软件复位 */
+  uint32_t boot_count;   /* 启动次数（.ram_section，只有断电才丢）：持续增长 = 固件在复位循环，
+                            用 reset_flags / g_fault 判断是哪种复位 */
+  uint32_t reset_flags;  /* 上一次复位原因的原始快照（RCC->RSR，读过即清；位定义见 stm32h750xx.h
+                            的 RCC_RSR_*：PORRSTF/PINRSTF/BORRSTF/SFTRSTF/WWDGRSTF/IWDGRSTF/LPWRRSTF） */
   uint32_t usb_mount_count; /* 主机完成枚举的次数（tud_mount_cb）—— 反复增长 = 主机在反复重枚举 */
   uint32_t usb_umount_count;/* 掉线次数（tud_umount_cb） */
 
-  /* ---- USB 第二轮诊断（2026-10-18：主机一直没枚举成功；用这些字段区分
-          「核没产生中断」/「中断了但没谈成」/「时钟或 PHY 没起来」）---- */
+  /* ---- USB 诊断：区分「核没产生中断」「中断了但没谈成」「时钟或 PHY 没起来」 ---- */
   uint32_t usb_irq_count;  /* OTG_FS 中断次数：插着线却恒为 0 → DWC2 核根本没产生中断 */
   uint32_t usb_sel;        /* RCC_D2CCIP2R.USBSEL：USB 内核时钟源（1 = PLL1Q，3 = HSI48，0 = 关） */
   uint32_t usb_clk_rc;     /* HAL_RCCEx_PeriphCLKConfig() 的返回值（0 = HAL_OK） */
-  uint32_t usb_gotgctl;    /* ↓ DWC2 寄存器实时快照（App_SnapshotUsb()，主循环每圈刷新） */
+  uint32_t usb_gotgctl;    /* ↓ DWC2 寄存器快照（App_SnapshotUsb()，仅在未枚举时刷新） */
   uint32_t usb_gintsts;    /*   GINTSTS：bit0 CURMOD（0 = device 模式）、bit12 USBRST、bit13 ENUMDNE */
   uint32_t usb_dctl;       /*   DCTL：bit0 RWUSIG = 1 → 软断开（DP 上拉没接上，主机看不到设备） */
   uint32_t usb_dsts;       /*   DSTS：bit0 SUSPSTS = 1 → 总线挂起（主机还没开始枚举） */
@@ -97,27 +104,46 @@ typedef struct {
   uint32_t usb_dcfg;       /*   DCFG：bit0-1 DSPD（设备速度） */
   uint32_t loop_count;     /* 主循环圈数：不涨 = 主循环卡死或根本没跑到 */
 
-  /* ---- 存活（liveness）探针：区分「主循环卡死」和「卡在某个中断里」 ----
-     读法：连读两次（间隔几秒），比较 systick_ticks / loop_count 是否增长：
-       * systick_ticks 不涨             → CPU 停在优先级 0 的中断里（SysTick 是优先级 15，被屏蔽），
-                                          或进了 Error_Handler 的 while(1)；看下面两个 depth 定位
-       * systick 涨、loop_count 不涨    → 主循环卡在某个阻塞调用里（main_stage 指出卡在哪一步）
-       * 两者都涨                       → 固件活着（那 USB 谈不成就是协议/主机侧问题） */
+  /* ---- 存活探针：间隔几秒连读两次，比较 systick_ticks / loop_count ----
+       systick 不涨、loop_count 不涨 → CPU 停在优先级 0 的中断里（SysTick 优先级 15 被屏蔽），
+                                        或卡在 Error_Handler 的 while(1)；用下面两个 depth 定位
+       systick 涨、loop_count 不涨   → 主循环卡在某个阻塞调用（main_stage 指出卡在哪一步）
+       两者都涨                       → 固件活着，问题在 USB 协议/主机侧 */
   uint32_t systick_ticks;   /* SysTick 中断次数（1 kHz）：不涨 = 连时钟节拍都停了 */
   uint32_t main_stage;      /* 主循环当前步骤：1 usb_task / 2 patch_service / 3 synth_service / 0 其他 */
   uint32_t usb_isr_depth;   /* >0 = halt 那一刻正在 USB 中断里（正常一闪而过；配合 systick 判断是否卡死） */
-  uint32_t audio_isr_depth; /* >0 = 正在音频 DMA 中断里渲染（优先级 0，卡这里会让整块板像死机） */
+  uint32_t audio_isr_depth; /* >0 = 正在音频 DMA 中断里（改架构后只搬数据，正常也是几十微秒） */
+
+  /* ---- 负载指标：判断"复音一多就滋滋/卡死"是不是 CPU 超预算 ----
+       预算：128 帧 @48 kHz = 2667 us = 480 MHz 下约 1,280,000 周期（每半缓冲）。
+       render_peak_cycles 接近 1.28M → 中断里渲染会撑爆半缓冲 → 断续/丢 MIDI 包；
+       cpu_permille 稳定在 600 以上就没有余量了。 */
+  uint32_t cpu_permille;        /* 引擎渲染负载（千分比：1000 = 正好用满实时预算） */
+  uint32_t render_peak_cycles;  /* 单块渲染的最大周期数（上电以来） */
+  uint32_t audio_underruns;     /* 预渲染环来不及填、音频中断重复上一块的次数 */
+
+  /* ---- 多音色：16 个通道当前各自的音色号，每通道 4 bit 打包（0..14，15 = 未知）----
+     验证：在 ch0 发 Program Change 5、ch1 发 8，这两个 nibble 应分别变成 5 和 8。 */
+  uint32_t chan_patch[4];
+
+  /* ---- SD 卡：挂载成功后的读写自检 + 内置音色导出结果 ----
+     位含义（详见 Synth/port/patch_storage_sd.c 顶部注释）：
+       bit0 目录可用 / bit1 至少写成功一个文件 / bit2 读回成功 / bit3 读回的文本能解析成音色 /
+       bit4 跳过过已存在的文件（卡上本来就有，没被覆盖）
+     新卡第一次上电期望 0x1F、sd_exported = 15；之后每次上电 sd_exported = 0。 */
+  uint32_t sd_selftest;
+  uint32_t sd_exported;
+  uint32_t sd_dat3;      /* 历史字段，恒为 0：0 = DAT3 已交回 SDMMC 外设（4-bit 正常） */
+  uint32_t sd_err;       /* 最后一次 SD 操作失败时 hsd1.ErrorCode（HAL_SD_ERROR_* 位）：
+                            4 = CMD_RSP_TIMEOUT、8 = DATA_TIMEOUT、32 = RX_OVERRUN、1 = CMD_CRC_FAIL … */
 } app_status_t;
 
 /* ---- HardFault 现场记录 ------------------------------------------------------
-   为什么需要：CubeMX 生成的 HardFault_Handler 只是 while(1)，不接调试器什么都看不到；
-   而"单步没事、全速跑就进 HardFault"这类问题多半发生在中断里 —— 单步时中断时序被改变，
-   现场就消失了。所以让固件自己把现场记下来（tools/status.ps1 能直接读成人话）。
-
-   放在 .ram_section（NOLOAD）：启动代码既不加载也不清零它 →
-     ① 复位之后、甚至重新烧写之前读到的现场都还在（事后验尸）；
-     ② 不占 .bss。
-   magic == APP_FAULT_MAGIC 才代表下面字段有效。 */
+   CubeMX 生成的 HardFault_Handler 只是 while(1)，不接调试器什么都看不到；而"单步没事、全速跑
+   就进 HardFault"这类问题多半发生在中断里 —— 单步会改变中断时序，现场就消失了。所以让固件
+   自己把现场记下来（tools/status.ps1 直接读成人话）。放在 .ram_section（NOLOAD）：启动代码
+   既不加载也不清零它 → 复位后现场还在（事后验尸），且不占 .bss。
+   magic == APP_FAULT_MAGIC 才代表下面字段有效（magic = 0 = 本次上电没崩过）。 */
 typedef struct {
   uint32_t magic;       /* APP_FAULT_MAGIC = 有效 */
   uint32_t count;       /* 累计进入 HardFault 的次数（反复发生 = 不是偶发） */
@@ -143,15 +169,13 @@ typedef struct {
 #define APP_AUDIO_CK_HZ     24576000u
 #define APP_AUDIO_CK_DIV    (APP_AUDIO_FS_HZ * 256u)   /* MCKDIV 分母（OSR 关闭） */
 
-/* QSPI 内存映射读（0xEB 四线快读）的空周期数。W25Q64 手册的时序是
-   指令(1线) → 24 位地址(4线) → 模式字节 M7-M0(4线) → 4 个空周期 → 数据(4线)。
-   与 WeAct 官方 BSP（资料\MiniSTM32H7xx-master\...\Drivers\BSP\W25QXX\w25qxx_qspi.c
-   的 QSPI_EnableMemoryMappedMode）一致：它的"指令 1 线"分支也正是 4，只有进 QPI 模式
-   （指令也走 4 线）时才用 6。若上板读出的采样数据全错位/全 0xFF，先把这里改成 6 再试。 */
+/* QSPI 内存映射读（0xEB 四线快读）的空周期数。W25Q64 时序：指令(1线) → 24 位地址(4线) →
+   模式字节(4线) → 4 空周期 → 数据(4线)。与 WeAct 官方 BSP 的 QSPI_EnableMemoryMappedMode()
+   一致（它的"指令 1 线"分支也是 4，只有 QPI 模式才用 6）。读出的采样若整体错位/全 0xFF，改成 6 再试。 */
 #define APP_QSPI_DUMMY_CYCLES   4u
 
-/* PLL2 由 CubeMX 生成的代码负责（Core/Src/sai.c 的 HAL_SAI_MspInit 里就是
-   5 MHz × (108 + 1101/8192) / 22 = 24.57599987 MHz，误差 −0.13 Hz），这里不再重复配置。 */
+/* PLL2 由 CubeMX 生成的代码负责（Core/Src/sai.c 的 HAL_SAI_MspInit：5 MHz × (108 + 1101/8192)
+   / 22 = 24.57599987 MHz，误差 −0.13 Hz），这里不再重复配置。 */
 
 /* g_app_status.fault 位定义 */
 #define APP_FAULT_SAI_INIT      (1u << 0)   /* HAL_SAI_InitProtocol() 失败 */
@@ -225,9 +249,8 @@ static void App_Fault(uint32_t bit)
 }
 
 /* 复位计数 + 复位原因。必须在最前面调用（在任何可能崩掉的初始化之前）。
-   为什么需要：HardFault 钩子是 NVIC_SystemReset()（见 Synth/port/platform_stm32.c），
-   一旦某处崩了，板子会不停复位 —— 主机侧看到的就是「设备起来又没了」，
-   表现成枚举失败/代码 10，看不出真正原因；boot_count 一读就明白。 */
+   boot_count 持续增长 = 板子在复位循环（主机侧表现成「设备起来又没了」= 枚举失败 / 代码 10）；
+   原因看 reset_flags（SFTRSTF = 软复位，多半来自 HardFault 后的复位策略）或 g_fault。 */
 static void App_RecordBoot(void)
 {
   const uint32_t flags = RCC->RSR;        /* 上一次复位的原因（位定义见 stm32h750xx.h 的 RCC_RSR_*） */
@@ -545,8 +568,8 @@ static void App_InitAudioPath(void)
 __attribute__((naked, noreturn)) void App_HardFaultRecord(void)
 {
   __asm volatile (
-    "mov  r0, lr                     \n"  /* r0 = EXC_RETURN（bit2 = 0 → 当时在中断里） */
-    "mrs  r1, msp                    \n"  /* r1 = 当前 MSP */
+    "mrs  r1, msp                    \n"  /* r1 = 当前 MSP（HardFault_Handler 序言已 push {r3, lr}） */
+    "ldr  r0, [r1, #4]               \n"  /* r0 = 真正的 EXC_RETURN：C 函数里 mov r0,lr 拿到的是 BL 返回地址，不是它 */
     "mrs  r2, psp                    \n"  /* r2 = 当前 PSP */
     "ldr  r3, =App_HardFaultRecordC  \n"
     "bx   r3                         \n"
@@ -566,7 +589,8 @@ static uint32_t *App_FindFaultFrame(uint32_t *sp)
     const uint32_t v = sp[i];
     if (((v & 0xFFFFFFE0u) == 0xFFFFFFE0u) && ((v & 0x1u) != 0u)) {
       uint32_t *f = sp + i + 1u;
-      if (((f[7] & 0x01000000u) != 0u) && ((f[7] & 0x1FFu) != 0u) &&
+      /* 只校验 T 位 + PC 在 flash：线程模式出事时 xPSR 低 9 位（IPSR）= 0，不能再要求非 0 */
+      if (((f[7] & 0x01000000u) != 0u) &&
           (f[6] >= 0x08000000u) && (f[6] < 0x08200000u)) {
         return f;
       }
@@ -596,8 +620,8 @@ static void App_FaultDelay(volatile uint32_t loops)
 }
 
 /* HardFault 指示灯：三短一长，循环 —— 与 App_LedTask() 的三种闪法（快闪/1 Hz 慢闪/短脉冲）
-   都不同，不接调试器一眼就能认出"进 HardFault 了"。之后不复位，停在原地，
-   方便调试器看调用栈、也方便 tools/status.ps1 读 g_fault。 */
+   都不同，不接调试器一眼就能认出"进 HardFault 了"。默认停在这里不复位（方便调试器看调用栈、
+   也方便 tools/status.ps1 读 g_fault）；SYNTH_PORT_FAULT_RESET = 1 时改为记录后软复位。 */
 static void App_FaultBlinkForever(void)
 {
   App_LedInit();                       /* 故障可能发生在 App_LedInit() 之前，这里自己配一次 PE3 */
@@ -613,14 +637,20 @@ static void App_FaultBlinkForever(void)
   }
 }
 
+/* used + externally_visible：本函数只被上面的 naked 汇编按*符号名*调用，编译器看不见引用关系。
+   没有这两个属性时 -flto 会把它当死代码删掉（链接报 undefined reference to 'App_HardFaultRecordC'）。 */
+__attribute__((used, externally_visible))
 void App_HardFaultRecordC(uint32_t exc_return, uint32_t msp, uint32_t psp)
 {
   uint32_t *frame;
 
-  if ((exc_return & 0x4u) != 0u) {
-    frame = (uint32_t *)psp;                        /* 线程模式（主循环里出事）：PSP 没被动过 → 精确 */
+  /* 兜底：万一拿到的不是 EXC_RETURN（例如以后序言变了），当作"不知道"，一律从栈上找 */
+  if ((exc_return & 0xFFFFFFE0u) != 0xFFFFFFE0u) { exc_return = 0u; }
+
+  if ((exc_return != 0u) && ((exc_return & 0x4u) != 0u)) {
+    frame = (uint32_t *)psp;                        /* 线程模式 + PSP：PSP 没被动过 → 精确 */
   } else {
-    frame = App_FindFaultFrame((uint32_t *)msp);    /* 中断里出事：从 MSP 往上找栈帧 */
+    frame = App_FindFaultFrame((uint32_t *)msp);    /* 其它情况：从 MSP 往上找栈帧 */
   }
 
   ++g_fault.count;
@@ -651,7 +681,10 @@ void App_HardFaultRecordC(uint32_t exc_return, uint32_t msp, uint32_t psp)
   g_fault.magic = APP_FAULT_MAGIC;      /* 最后写：读到 magic 就说明前面都写完了 */
 
   /* 串口直接打出来（阻塞写：这是"发完就不返回"的场景，环形缓冲里的东西不会再有机会发出去）。
-     注意这里只写 UART 寄存器，不依赖 SysTick/HAL 状态，进 HardFault 也能用。 */
+     注意这里只写 UART 寄存器，不依赖 SysTick/HAL 状态，进 HardFault 也能用。
+     发布构建（-DSYNTH_RELEASE=ON → SYNTH_PORT_DEBUG_UART=0）时整段去掉：现场仍在 g_fault 里，
+     用 tools\status.ps1 读得到。 */
+#if SYNTH_PORT_DEBUG_UART
   {
     char line[256];
     const int n = snprintf(line, sizeof(line),
@@ -665,9 +698,86 @@ void App_HardFaultRecordC(uint32_t exc_return, uint32_t msp, uint32_t psp)
       dbg_write_blocking(line, ((uint32_t)n < sizeof(line)) ? (uint32_t)n : (uint32_t)(sizeof(line) - 1u));
     }
   }
+#endif
 
+#if SYNTH_PORT_FAULT_RESET
+  /* 现场已写进 g_fault（.ram_section，复位不丢）→ 软复位，板子自动恢复发声 */
+  NVIC_SystemReset();
+#endif
   App_FaultBlinkForever();              /* 不返回 */
 }
+
+/* 让"只给外部工具看的"计数器活下来。
+   tools/status.ps1 用 arm-none-eabi-nm 按名字找 g_synth_* 这些符号再 dump 内存；但发布构建里
+   日志代码被裁掉后，这些计数器在 C 代码里可能一个读者都没有，链接的 --gc-sections（LTO 下更
+   激进）会把它们整段回收，符号就没了（现象：status.ps1 报 "ELF 里找不到符号 g_synth_audio_xruns"）。
+   这里读一遍塞进 volatile 变量 —— 有真实引用，段就不会被回收，开销只有一次（不是热路径）。
+   新增"外部工具要看"的计数器时，加到这个列表里。 */
+static void App_KeepObservablesAlive(void)
+{
+  volatile uint32_t sink = 0u;
+  sink ^= g_synth_audio_xruns;
+  sink ^= g_synth_audio_underruns;
+  sink ^= g_synth_audio_isr_depth;
+  sink ^= g_synth_midi_rx_bytes;
+  sink ^= g_synth_usb_mount_count;
+  sink ^= g_synth_usb_umount_count;
+  sink ^= g_synth_usb_irq_count;
+  sink ^= g_synth_usb_isr_depth;
+  sink ^= g_synth_systick_ticks;
+  sink ^= g_synth_usb_clk_rc;
+  (void)sink;
+}
+
+/* SD 卡初始化：参数与 CubeMX 生成的 MX_SDMMC1_SD_Init()（Core/Src/sdmmc.c:41-50）一致，
+   但**允许失败**——没插卡时 HAL_SD_Init() 必定失败，生成代码会 Error_Handler()、整块板停在
+   while(1)（USB 不枚举、没声音）。返回 0 = 初始化成功。
+   总线用 4-bit（CubeMX 的默认值）：DAT3 交回 SDMMC 外设，速度也够（FATFS/Target/bsp_driver_sd.c
+   里 BSP_SD_Init() 之后还会调 HAL_SD_ConfigWideBusOperation(SDMMC_BUS_WIDE_4B)）。 */
+#if SYNTH_PORT_SD_ENABLE
+static int App_SdInit(void)
+{
+  hsd1.Instance = SDMMC1;
+  hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
+  hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
+  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
+  hsd1.Init.ClockDiv = 1;      /* 数据阶段 48MHz/(2*1) = 24 MHz（≤25 MHz，符合默认速率上限）。
+                                  注意别写 0：HAL 在 HAL_SD_ConfigWideBusOperation() 里对
+                                  "ClockDiv >= sdmmc_clk/(2*25MHz)"（48 MHz 时 = 0）判真，于是把
+                                  CLKDIV 写成 0 = 分频旁路（48 MHz 直接怼卡），实测表现为
+                                  HAL 返回 RX_OVERRUN(32) → f_mount 报 FR_DISK_ERR(1)。 */
+  return (HAL_SD_Init(&hsd1) == HAL_OK) ? 0 : -1;
+}
+#endif
+
+#if SYNTH_PORT_SD_ENABLE   /* App_SdTryPowerMode 依赖上面的 App_SdInit()，只在 SD 编进来时才编译 */
+/* 把 PD4（MicroSD_SW）按指定状态配好再试一次初始化 —— 曾经用来验证"PD4 是不是卡座电源"，
+   结论是三种状态（输出低 / 输出高 / 输入上拉）全都初始化失败，PD4 与 SD 无关。
+   保留这段代码是为了以后换板子时能一键复现这个实验：把 main() 第 9 步换成
+   for (mode = 1; mode <= 3; ++mode) { if (App_SdTryPowerMode(mode) == 0) break; } 即可。 */
+static int App_SdTryPowerMode(uint32_t mode) __attribute__((unused));
+static int App_SdTryPowerMode(uint32_t mode)
+{
+  GPIO_InitTypeDef gpio = {0};
+  gpio.Pin = MicroSD_SW_Pin;                     /* PD4 */
+  if (mode == 3u) {
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+  } else {
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  }
+  HAL_GPIO_Init(MicroSD_SW_GPIO_Port, &gpio);
+  if (mode != 3u) {
+    HAL_GPIO_WritePin(MicroSD_SW_GPIO_Port, MicroSD_SW_Pin,
+                      (mode == 1u) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+  }
+  HAL_Delay(5);                                  /* 等卡座电源稳定 */
+  return App_SdInit();
+}
+#endif
 
 /* USER CODE END 0 */
 
@@ -748,6 +858,7 @@ int main(void)
   /* 0) 复位计数与复位原因：放在最前 —— 后面任何一步崩掉（HardFault 钩子会 NVIC_SystemReset）
         都能从 g_app_status.boot_count 看出来是「复位循环」，而不是「USB 没枚举」 */
   App_RecordBoot();
+  App_KeepObservablesAlive();   /* 保住 status.ps1 要读的计数器符号（--gc-sections/LTO 会回收） */
 
   /* 1) 内存与时钟。MPU_Config() 必须最先：Region0 把 0x60000000–0xDFFFFFFF 判成 NO_ACCESS，
         而 0x90000000（QSPI 映射窗口）是靠 Region2 放行的 —— 任何对它的访问都必须在
@@ -823,7 +934,12 @@ int main(void)
   synth_port_init();
 
   cfg.sample_rate       = SYNTH_SR_DEFAULT;        /* 48000（Synth/include/synth/patch.h:11） */
-  cfg.max_voices        = SYNTH_MAX_VOICES;        /* 16（patch.h:13） */
+  /* 声部上限：按实测定的（2026-10-19，出厂音色 1，16 声部同时按下的 cpu_permille）：
+        -O2 原始 2121‰ → 控制率 8→32 + 噪声/子振按需 1450‰ → -O3 -ffast-math 1311‰。
+     即 16 声部要 1.3 倍实时；单声部约 8.6% 实时预算，实时上限约 11 声部。
+     取 10 留 15~20% 余量给效果链和 FM 音色（FM 单声部成本是模拟音色的 3 倍多）。
+     想更多声部：先做 DSP 优化（正弦表插值、把引擎放进 ITCM），再把这里调大。 */
+  cfg.max_voices        = 10u;
   cfg.factory_bank      = synth_factory_bank;      /* patch.h:100 内置出厂音色表 */
   cfg.factory_bank_size = synth_factory_bank_size; /* patch.h:101 */
 
@@ -850,11 +966,42 @@ int main(void)
           (unsigned long)App_UsbKernelClockHz());
   dbg_log("boot", "==== 进入主循环（等主机枚举 + MIDI 输入）====");
 
-  /* 9) SD 卡：只有 Synth/port/synth_port_config.h 里 SYNTH_PORT_SD_ENABLE = 1 时才编进来 */
+  /* 9) SD 卡：只有 Synth/port/synth_port_config.h 里 SYNTH_PORT_SD_ENABLE = 1 时才编进来。
+     为什么不用 MX_SDMMC1_SD_Init()：CubeMX 生成的 Core/Src/sdmmc.c 在 HAL_SD_Init() 失败时直接
+     Error_Handler()（整块板停在 while(1)：USB 不枚举、没声音）。没插卡时 HAL_SD_Init() 必定失败，
+     所以这里自己配同样的参数但**允许失败** —— 没卡就当作"没有 SD"，合成器照常工作。
+
+     两个已经排除/确认的硬件事实（都记在 docs/handoff.md）：
+       * PD4（CubeMX 里叫 MicroSD_SW）不是卡检测也不是卡座电源：输出低/输出高/输入上拉三种状态
+         各试一次初始化，全部失败（WeAct 官方 04-SD_Test 例程也没有任何检测脚）。
+       * **DAT3(PC11) 是关键**：实测插卡时 PC11 = 0、拔卡时 = 1（其余 D0/D1/D2/CK/CMD 都不变）。
+         SD 模式下 DAT3 同时就是 SPI 模式的 CS —— 卡上电时 CS 为低，卡就进 SPI 模式，之后用 SD
+         原生命令（CMD8 等）问它一声不吭 ⇒ HAL 报 ErrorCode=4「CMD 响应超时」，与现象完全吻合。
+     2026-10-19 结论更新：**旧卡就是坏/挑设备的**——换 32 GB 卡后 HAL_SD_Init() 完全成功
+     （ErrorCode = 0、CardType = SDHC、61,132,800 块 × 512 B）。所以 DAT3(PC11) 不再人为顶高：
+     恢复 4-bit 总线、DAT3 交回 SDMMC 外设。之前把它当普通 GPIO 输出高会和 4-bit 传输抢同一条线，
+     实测表现就是 HAL 返回 RX_OVERRUN(32) → f_mount() 报 FR_DISK_ERR(1)。
+     sd_dat3 字段保留但恒为 0：0 = DAT3 已交回外设（4-bit 正常）；1 = 历史值（曾用 GPIO 顶高）。 */
 #if SYNTH_PORT_SD_ENABLE
-  g_app_status.sd_mount = synth_port_sd_mount();
-  if (g_app_status.sd_mount != 0) {
-    App_Fault(APP_FAULT_SD_MOUNT);
+  g_app_status.sd_dat3 = 0u;
+  if (App_SdInit() != 0) {
+    g_app_status.sd_err = hsd1.ErrorCode;   /* 卡没起来：把 HAL 的错误位留下来给 status.ps1 看 */
+    g_app_status.sd_mount = -3;        /* -3 = 卡初始化失败（没插卡 / 卡座硬件问题）：不置故障位 */
+  } else {
+    g_app_status.sd_mount = synth_port_sd_mount();
+    g_app_status.sd_err = hsd1.ErrorCode;   /* 挂载失败时这里通常是 32(RX_OVERRUN)/8(DATA_TIMEOUT) 等 */
+    if (g_app_status.sd_mount != 0) {
+      App_Fault(APP_FAULT_SD_MOUNT);   /* 卡能初始化却挂不上文件系统 → 值得报警（格式/接触问题） */
+    } else {
+      /* 挂载成功 → 跑一次读写自检，并把 15 个内置音色导出成 /synth/NNN.syn 模板
+         （已存在的文件不覆盖，所以卡上改过的音色不会被开机冲掉）。结果存进 g_app_status，
+         用 tools/status.ps1 读；位含义见 Synth/port/patch_storage_sd.c 顶部注释。 */
+      g_app_status.sd_selftest = synth_port_sd_selftest();
+      g_app_status.sd_exported = synth_port_sd_exported();
+      dbg_log("sd", "mounted (dat3=%lu), selftest=0x%lx exported=%lu",
+              (unsigned long)g_app_status.sd_dat3,
+              (unsigned long)g_app_status.sd_selftest, (unsigned long)g_app_status.sd_exported);
+    }
   }
 #else
   g_app_status.sd_mount = -1;
@@ -873,6 +1020,10 @@ int main(void)
           * synth_service()   —— 引擎的非实时事务（波表/采样切换、patch 生效） */
   while (1)
   {
+    /* 0) 先喂音频：环缓冲有空位就提前渲染一块（渲染在主循环，不在优先级 0 的中断里）。
+          这是"复音一多就断续/卡死"的根治措施：中断只做 memcpy，CPU 再忙也不会拖死 USB。 */
+    synth_port_audio_pump();
+
     /* main_stage 标记"卡在哪一步"：halt 时看它就知道主循环停在哪里。配合 systick_ticks 判死活：
          systick 不涨       → CPU 停在优先级 0 的中断里（SysTick 优先级 15 被屏蔽）或 Error_Handler 里
          systick 涨但 loop 不涨 → 主循环卡在 main_stage 那一步的阻塞调用里 */
@@ -884,7 +1035,7 @@ int main(void)
     synth_service();
     g_app_status.main_stage = 0u;
 
-    /* 心跳与诊断：LED 编码状态（见 App_LedTask），寄存器快照每圈刷新。
+    /* 心跳与诊断：LED 编码状态（见 App_LedTask），USB 寄存器快照只在未枚举时刷新。
        loop_count 不涨 = 主循环卡死（而不是"USB 谈不拢"）。 */
     ++g_app_status.loop_count;
     App_LedTask();
@@ -894,14 +1045,35 @@ int main(void)
     g_app_status.usb_isr_depth   = g_synth_usb_isr_depth;
     g_app_status.audio_isr_depth = g_synth_audio_isr_depth;
 
+    /* 负载指标（读引擎内部统计；用来验证"复音多"时是否还有余量） */
+    {
+      synth_stats_t st;
+      synth_get_stats(&st);
+      g_app_status.cpu_permille       = synth_cpu_load_permille();
+      g_app_status.render_peak_cycles = st.render_peak_cycles;
+    }
+    g_app_status.audio_underruns = g_synth_audio_underruns;
+
+    /* 多音色映射：16 个通道的音色号打包成 4 个字（每通道 4 bit，15 = 未知/越界） */
+    for (uint32_t w = 0; w < 4u; ++w) {
+      uint32_t packed = 0u;
+      for (uint32_t n = 0; n < 4u; ++n) {
+        const uint16_t p = synth_get_channel_patch((uint8_t)(w * 4u + n));
+        packed |= ((p > 14u) ? 15u : (uint32_t)p) << (4u * n);
+      }
+      g_app_status.chan_patch[w] = packed;
+    }
+
 #if SYNTH_PORT_USB_ENABLE
     /* USB 诊断（调试器里看 g_app_status）：
          usb_mounted = 0 → 主机没枚举成功，问题在固件/硬件侧（PHY 供电、时钟、AF、线、口）
          usb_mounted = 1 而 Windows 里仍看不到 → 问题在主机侧（驱动/查看位置/线材质量）
        第二轮：usb_irq_count / usb_gotgctl / usb_dsts / usb_dctl 用来区分
          「核没中断」「中断了但没谈成」「时钟或 PHY 没起来」 */
-    App_SnapshotUsb();
     g_app_status.usb_mounted      = tud_mounted() ? 1u : 0u;
+    if (g_app_status.usb_mounted == 0u) {
+      App_SnapshotUsb();            /* 只在没枚举成功时刷新：正常运行时省掉每圈的寄存器读 */
+    }
     g_app_status.midi_rx_bytes    = g_synth_midi_rx_bytes;
     g_app_status.usb_mount_count  = g_synth_usb_mount_count;
     g_app_status.usb_umount_count = g_synth_usb_umount_count;
@@ -915,7 +1087,9 @@ int main(void)
          boom      = 单块渲染最大 CPU 周期（480 MHz 下 1 ms = 480000 周期，接近就危险）
          xrun      = SAI DMA 出错次数（>0 就是声音断续的来源）
          snd       = 主循环当前阶段（1 usb_task / 2 patch_service / 3 synth_service）
-       卡死检测：主循环 200 ms 没推进就打一行 STALL（带阶段号和两个中断深度）。 */
+       卡死检测：主循环 200 ms 没推进就打一行 STALL（带阶段号和两个中断深度）。
+       发布构建（SYNTH_PORT_DEBUG_UART=0）里这整块不编：它只为日志存在。 */
+#if SYNTH_PORT_DEBUG_UART
     {
       static uint32_t s_stat_ms = 0u;
       static uint32_t s_loop_prev = 0u;
@@ -953,6 +1127,7 @@ int main(void)
         s_loop_prev = g_app_status.loop_count;
       }
     }
+#endif /* SYNTH_PORT_DEBUG_UART */
   }
 }
 

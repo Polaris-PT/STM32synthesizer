@@ -26,3 +26,7 @@ target_link_libraries(ssynth_render PRIVATE synthcore)
 
 add_executable(ssynth_tests "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_dsp.cpp" $<TARGET_OBJECTS:synthcore>)
 target_link_libraries(ssynth_tests PRIVATE synthcore)
+
+# 渲染耗时基准：定位"复音一多就滋滋/卡死"是否 CPU 超预算
+add_executable(ssynth_bench bench_main.cpp $<TARGET_OBJECTS:synthcore>)
+target_link_libraries(ssynth_bench PRIVATE synthcore)

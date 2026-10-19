@@ -52,6 +52,26 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
 - FM：3 个内置 DX7 音色发声正常、八度比 2.00、释音到 0；`.syx` 压缩往返 **0/155 字节差异**；bank 解出 32 音色。
 - ROMpler：多音区 + 重采样音高正确、循环持续、释音归零；`.ins` 解析/往返/错误处理通过。
 - 体积（交叉编译 Cortex-M7 -O2）：自有代码 `.text` **37,455B**；加 HAL+FatFs+SAI(40-50KB)+TinyUSB(10-15KB) ≈ **88-103KB/128KB** ✓。
+- 体积（**实机固件，2026-10-19 实测**，SD+FATFS 已启用）：
+  - 默认构建（串口日志开，日常调试用）：**FLASH 124,792 B / 128 KB = 95.21%**（`build\RelWithDebInfo`）
+  - 发布构建 `tools\build.ps1 -Trim`（关调试日志 + 冷路径 -Os）：**FLASH 120,072 B = 91.61%**（`build\release`）
+  - 其它区两版相同：AXI RAM 400,800 B (76.45%)、DTCMRAM 46,336 B (35.35%)
+  - ⇒ 发布版留 **~10.7 KB** flash 余量，**QSPI XIP（把 FatFs/TinyUSB 搬到外部 flash）暂时不必做**。
+  - 两个版本都已上板验证：发布版 `-Trim` 实测 `fault = 0`、`usb_mounted = 1`、`audio_ck = 24.576 MHz`、
+    `sai_mckdiv = 2`、`qspi_id = 0xEF4017`、发 4 组 note on/off 后 `midi_rx_bytes = 1218`、`cpu_permille = 232‰`、
+    `audio_underruns = 0`、`status.ps1` 结论 `✓ 固件侧一切正常`。
+- **LTO 试过并放弃**（`-flto` 能到 116,172 B / 88.63%，省 ~4 KB，但和 HAL 的弱符号覆盖模式冲突）：
+  HAL 里 `HAL_*_MspInit()` 是 `__weak` 空实现、强定义在我们的 `Core/Src/*.c`；整程序 LTO 时 GCC 让库里那个
+  弱版本"胜出"，ELF 里 `HAL_SAI_MspInit` 符号整个消失 → 实机 `fault = 0x126`（SAI 时钟/SAI DMA/AUDIO_START/QSPI_MM
+  四个故障位全亮）、没声音、QSPI 映射失败。给 HAL 库加 `-fno-lto` 能修好（119,928 B），但省下的只剩 ~144 B，不值得；
+  给 `Core/Src` 加 `-fno-lto` 无效（目标级 `-flto` 在命令行上排得更靠后）。所以 **不提供 LTO 开关**。
+  将来若要重试：`App_HardFaultRecordC` 需要 `__attribute__((used, externally_visible))`（naked 汇编按符号名调用它）。
+- 发布构建 `tools\build.ps1 -Trim -Flash` 的两个坑：
+  ① `status.ps1` 靠 `arm-none-eabi-nm` 按名字读内存，发布版里没有 C 读者的计数器会被 `--gc-sections` 回收
+     （现象：`ELF 里找不到符号 g_synth_audio_xruns`）→ `Core/Src/main.c` 的 `App_KeepObservablesAlive()` 读一遍保活，
+     以后新增"给外部工具看"的变量记得加进去；
+  ② 发布版**没有串口日志**（`SYNTH_PORT_DEBUG_UART=0`），读状态要指向同一份 ELF：
+     `tools\status.ps1 -Elf build\release\STM32synthesizer.elf`。调试期仍用默认构建（有日志）。
 
 ## 5. 待办（按优先级）
 1. ~~循环接缝交叉淡化未生效~~ → **已修复（2026-10-17）**。
@@ -80,19 +100,40 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
      + `HAL_QSPI_MemoryMapped()`）；`g_app_status.qspi_id` 应为 `0xEF4017`。
    - **内存策略调整**：`.data/.bss` 默认搬到 AXI SRAM，DTCM 只留栈/堆 + `SYNTH_HOT` 热点表
      （正弦表 4 KB + 波表 32 KB 已搬进 `.dtcm_bss`，由 `App_ZeroDtcmBss()` 清零）。
-   - 实测（RelWithDebInfo，SD 关闭）：FLASH 92,168 B (70.3%)、DTCM 46,336 B (35.4%)、AXI 247,548 B (47.2%)；
-     `SYNTH_PORT_SD_ENABLE=1` 时 FLASH 109,532 B (83.6%)、AXI 392,576 B (74.9%)。
+   - 实测（RelWithDebInfo，SD 关闭）：FLASH 103,280 B (78.8%)、DTCM 46,336 B (35.4%)、AXI 256,060 B (48.8%)
+     —— 其中约 8~11 KB 是诊断代码与串口日志（可整体删，见 `docs/code-map.md` 第 9 节）。
+     **（2026-10-19 起 SD 默认打开、结构体对齐修正后布局有变，最新数字见下一条第 5 项。）**
+5. **多音色（每通道一个音色）+ SD 卡启用（2026-10-19，均已上板验证）**：
+   - 多音色：`Engine::chan_patch[16]`/`chan_idx[16]`，Program Change 只切本通道（标准 GM 行为），
+     新建 `ApplyPatchIndexToChannel()`；`StartVoice()`/`AllocateVoice()`/`VoiceNoteOn/Off()`/`EnsureFmVoice()`
+     全部带 `ch` 参数；`ControlChange()` 的 patch 类 CC（5/72/73/76/77/79）写本通道并推给该通道在响的声部；
+     声部侧是 `Voice::patch_` 快照（`Synth/src/core/voice.h`，`NoteOn` 时 memcpy、`Render` 里只读自己的）。
+     对外 API：`synth_set_channel_patch(ch, idx)` / `synth_get_channel_patch(ch)`（越界 0xFFFF）。
+     已知限制：FM 引擎一次只能载入一条 DX7 音色（两个不同 FM 音色的通道会来回换载）、ROMpler 乐器全局一个、
+     效果链全局一条（参数跟随"主音色"`e.patch`，即最后一次切换的音色）。
+   - SD 卡：`SYNTH_PORT_SD_ENABLE = 1`；**插卡才挂载**（PD4 低 = 卡在座，没卡 `sd_mount = -2` 且不置故障位，
+     因为没卡时 `hsd1` 未初始化、直接 `f_mount` 会走到 `HAL_SD_Init` 上）。
+     文件约定 `0:/synth/NNN.syn`（文本音色或 DX7 `.syx`）与 `0:/synth/NNN.ins`（采样乐器）：
+     Program Change 后主循环的 `synth_port_patch_service()` 发现音色号变化就尝试从 SD 覆盖内置音色。
+   - 为塞进 128 KB flash：FatFs 关掉 `_USE_MKFS`/`_USE_FASTSEEK`/`_USE_STRFUNC` 并开 `_FS_TINY`
+     （`FATFS/Target/ffconf.h`）；`FatFs` 库、`STM32_Drivers` 里的 `sdmmc.c`、TinyUSB 六个源文件用 `-Os`
+     编译（`CMakeLists.txt`）。`FATFS/Target/sd_diskio.c` 的 `SD_read/SD_write` 前后各加一次
+     `SCB_CleanInvalidateDCache()`（SDMMC 用 IDMA 直写 AXI SRAM，D-Cache 感知不到；CubeMX 重生成会覆盖）。
+   - 实测（SD 打开）：**FLASH 125,168 B (95.50%)**、AXI RAM 409,024 B (78.02%)、DTCMRAM 46,336 B (35.35%)。
+     ⚠ flash 只剩约 6 KB —— 再加功能之前先删诊断代码（8~11 KB，见 `docs/code-map.md` 第 9 节）。
+   - 上板验证：ch0 发 PC 5、ch1 发 PC 8 后，`g_app_status.chan_patch[0] = 0x00000085`
+     （`tools/status.ps1` 打印 `ch0=PC5(Square Keys)   ch1=PC8(PWM Strings)`）；`fault = 0`、
+     `audio_underruns = 0`、`cpu_permille ≈ 142‰`、`sd_mount = -2`（当时没插卡）。
     - **USB 板级初始化补了一处必需项**：`Synth/port/platform_stm32.c` 的 `usb_hw_init()` 现在第一句是
       `HAL_PWREx_EnableUSBVoltageDetector()`。H7 的 FS PHY 由 VDD33USB 供电，电平检测器不开时 DP 上拉
       不生效 → 主机侧完全看不到设备（连"未知 USB 设备"都不出现）。CubeMX 为同一块板生成的
       `HAL_PCD_MspInit()` 第一句就是它；TinyUSB 的 dwc2 驱动不管 PWR。
-    - **USB 诊断**：`g_app_status` 增到 **28 个 u32** —— 除 `usb_mounted` = `tud_mounted()`、
-      `midi_rx_bytes` 之外，还有 `boot_count` / `reset_flags`（判断**复位循环**：HardFault 钩子是
-      `NVIC_SystemReset()`，肉眼只看得到"枚举失败"；⚠ 烧写和按复位键都会让 `boot_count` +1，
-      要「不烧写不复位连读两次看是否增长」）、`usb_mount_count` / `usb_umount_count`（枚举/掉线次数），
-      以及第三轮加的 USB 寄存器快照 `usb_irq_count`（OTG_FS 中断次数，恒为 0 = 核没中断）、
-      `usb_dctl` / `usb_dsts` / `usb_gotgctl` / `usb_gintsts` / `usb_gccfg` / `usb_gusbcfg` / `usb_dcfg`、
-      `usb_sel` / `usb_clk_rc`、`loop_count`（不涨 = 主循环卡死）。主循环里刷新。
+    - **USB 诊断**：`g_app_status` 现在是 **32 个 u32** —— 除 `usb_mounted` = `tud_mounted()`、
+      `midi_rx_bytes` 之外，还有 `boot_count` / `reset_flags`（判断**复位循环**；⚠ 烧写和按复位键都会让
+      `boot_count` +1，要「不烧写不复位连读两次看是否增长」）、`usb_mount_count` / `usb_umount_count`
+      （枚举/掉线次数）、USB 寄存器快照（`usb_irq_count` / `usb_dctl` / `usb_dsts` / `usb_gotgctl` /
+      `usb_gintsts` / `usb_gccfg` / `usb_gusbcfg` / `usb_dcfg` / `usb_sel` / `usb_clk_rc`；**仅在未枚举时刷新**）、
+      `loop_count`，以及存活探针 `systick_ticks` / `main_stage` / `usb_isr_depth` / `audio_isr_depth`。
       ⚠ `usb_ck_hz` 不能用 `HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_USB)` —— H7 的 HAL 里
       **没有 USB 分支**（`stm32h7xx_hal_rcc_ex.c:1881` 起），恒返回 0；现已改为按 mux + PLL1Q 自算。
     - **PE3 心跳灯**（`App_LedTask`，不接调试器也能看状态）：100 ms 快闪 = 有故障位；
@@ -108,10 +149,11 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
       ⇒ 故障几乎肯定在中断上下文（首选嫌疑：音频 DMA1_Stream0，优先级 0）。
       `tools/status.ps1` 已能解码这一段（CFSR 逐位、犯规地址、出事时的异常号、PC/LR 源码行）。
    - **构建/下载脚本**：`tools/build.ps1`（`-BuildType/-Generator/-BuildDir/-Clean/-Flash/-NoSize`）、
-     `tools/flash.ps1`（OpenOCD + CMSIS-DAP，自动挑最新的 `STM32synthesizer.elf`，`-DryRun` 只打印命令）、
-     `.vscode/tasks.json`（六个任务）、`CMakePresets.json`（四组预设，**务必带 toolchainFile**）。
-     ⚠ 两个 .ps1 必须保持 **UTF-8 BOM**：PowerShell 5.1 会把无 BOM 的 UTF-8 当 GBK 读，中文注释乱码后
-     整个脚本报 `Unexpected token`。
+     `tools/flash.ps1`（OpenOCD + CMSIS-DAP；不指定 `-Elf` 时**优先** `build\<BuildType>\STM32synthesizer.elf`，
+     没有再挑最新的，避免误烧旧构建目录里遗留的 ELF；`-DryRun` 只打印命令）、
+     `.vscode/tasks.json`（七个任务）、`CMakePresets.json`（四组预设，**务必带 toolchainFile**）。
+     ⚠ 三个 .ps1 必须保持 **UTF-8 BOM**：PowerShell 5.1 会把无 BOM 的 UTF-8 当 GBK 读，中文注释乱码后
+     整个脚本报 `Unexpected token`；而 `edit` 工具会**悄悄抹掉 BOM**，改完必须补回。
 5. **仍需做**：
    - ⚠ 启用 SD（`Synth/port/synth_port_config.h` 的 `SYNTH_PORT_SD_ENABLE` 置 1）之前，先解决
      SDMMC 内部 IDMA 与 D-Cache 的一致性（FATFS 对象/采样池目前是可缓存的 AXI SRAM）。
@@ -140,3 +182,27 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
   （用 `[1]` 会读到大小 → dump 到垃圾地址）。
 - **openocd 的 `mdw`/`echo` 输出经 PowerShell 捕获会丢**（只有 stderr 的 Info/Error 能看到）：
   读内存一律 `dump_image {文件} 0x地址 长度` 再用 `[BitConverter]::ToUInt32` 解。
+- **2026-10-19 清理**：删掉死代码 `synth_port_hard_fault_hook()`（只有定义、全工程无引用）、
+  `dbg_hex()` / `dbg_take_dropped()`（无人调用）；`SYNTH_PORT_MIDI_TRACE` 默认改 **0**（每包一行太吵）；
+  新增 `SYNTH_PORT_FAULT_RESET`（**0 = 默认**：记录现场 + 三短一长闪灯、不复位；1 = 记录后软复位以便自动恢复）。
+  HardFault 现场、存活探针、心跳灯**保留**（成本几十字节，是排查"卡住/复位"的唯一手段）。
+- **`sizeof` 不是 4 的倍数的结构体，禁止整体赋值/按值传参**（2026-10-19，切音色必崩的根因）：
+  `synth_patch_t` 全是 `uint8_t` ⇒ `sizeof = 53`、对齐 1，`e.patch = e.bank[5]` 的源地址是
+  `bank+265`（奇数）→ GCC 展开成 `ldr/str` 整字拷贝 → Cortex-M7 非对齐字访问 → UNALIGNED
+  HardFault（上位机一点「切换音色」就卡死、PE3 三短一长）。修法：`Synth/include/synth/patch.h`
+  加 `__attribute__((aligned(4)))`（`sizeof` 自动补到 56）+ `engine.cpp:106/:305` 改 `memcpy`。
+  判据：全 `uint8_t` 的结构体先看 `sizeof % 4`。详见 `docs/phase2-review.md` §10。
+- **HardFault 记录器取 `EXC_RETURN` 不能读 `LR`**：Handler 里 `bl` 已经把 LR 换成了返回地址，
+  真正的 `EXC_RETURN` 在 `[MSP+4]`（Handler 序言 `push {r3, lr}` 存下来的），异常帧在 `[MSP+8]`；
+  找帧时也不要要求 IPSR≠0（线程模式出事时 IPSR 就是 0）。详见 `phase2-review.md` §8 末尾。
+- **MIDI 解析**：系统公共消息 `0xF1`(1)/`0xF2`(2)/`0xF3`(1)/`0xF6`(0) 不能当 2 个数据字节，
+  且不建立 running status（见 `Synth/src/midi/midi_parser.h`）。上位机 `D:\Tools\midi_ctl` 的
+  「切换音色」发的是标准 Program Change（`0xC0|ch`，program = 滑块值−1，0..127），
+  只有 0..14 命中本机音色库，其余按设计忽略（引擎里 `unknown_cc`/`req_patch_index` 越界保护）。
+- **`tools\build.ps1` 别让它在"有 Ninja 的机器"上自动挑 Ninja**：本机（沙箱环境）里 `cmake -G Ninja`
+  会卡死在 `-- Detecting C compiler ABI info`，构建目录里只剩 `CMakeFiles\CMakeScratch`。
+  验证时统一加 `-Generator 'MinGW Makefiles'`；被中断的构建会留下 cmake/ninja 僵尸进程
+  （`Get-Process cmake,ninja | Stop-Process -Force` 后再重配）。
+- **`edit` 工具会抹掉 `.ps1` 的 UTF-8 BOM**，症状是脚本报 `Unexpected token`（还伴随中文提示乱码），
+  很像"脚本逻辑被改坏了"。改完立刻补：
+  `[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))`。

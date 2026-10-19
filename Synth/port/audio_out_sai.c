@@ -1,45 +1,102 @@
-/* SAI3 Block B + DMA 循环输出。半传输/传输完成中断里直接渲染整块。 */
+/* SAI3 Block B + DMA 循环输出。
+ *
+ * 架构（2026-10-19 改）：**渲染在主循环，中断里只搬数据**。
+ *
+ * 之前是"半传输/传输完成中断里直接渲染整块"：复音一多，渲染耗时超过半缓冲时间
+ * （128 帧 @48 kHz = 2.67 ms）就把优先级 0 的音频中断撑爆 —— 表现为
+ *   ① DMA 欠载 → 声音断续/滋滋；
+ *   ② USB 中断（优先级 5）被推迟 → MIDI 包丢失（note-off 丢了 = 音停不下来）；
+ *   ③ 极端情况主循环完全跑不动 → 整块板像死机。
+ *
+ * 现在：主循环调 synth_port_audio_pump() 提前渲染 4 块到环形缓冲里；音频中断只在
+ * 半缓冲结束时 memcpy 一块（~1 KB）并做 D-Cache 写回，耗时几十微秒。
+ * 主循环来不及填时中断会重复上一块（并累加 g_synth_audio_underruns），
+ * 声音会短暂"卡"一下，但不会把 USB/主循环拖死。
+ */
 #include "synth_port_config.h"
 #include "synth/synth.h"
 #include "debug_uart.h"
 
+#include <string.h>
+
 #if defined(SYNTH_SAI_HANDLE)
 
-/* 2 个半缓冲 × 128 帧 × 2 声道，int32（24bit 左对齐）。
-   必须放 AXI SRAM（.ram_section）：DMA1/DMA2 访问不到 DTCM。
-   AXI SRAM 是 Cacheable 的，所以 DMA 读之前要把刚渲染的数据写回内存（audio_clean）。 */
-static int32_t SYNTH_PORT_AUDIO_RAM g_audio_buf[SYNTH_PORT_BLOCK_FRAMES * 2u * SYNTH_PORT_WORDS_PER_FRAME]
-    __attribute__((aligned(32)));
+/* 一个渲染块的 word 数（128 帧 × 2 声道） */
+#define SYNTH_AUDIO_BLOCK_WORDS (SYNTH_PORT_BLOCK_FRAMES * SYNTH_PORT_WORDS_PER_FRAME)
+#define SYNTH_AUDIO_BLOCK_BYTES ((uint32_t)sizeof(int32_t) * SYNTH_AUDIO_BLOCK_WORDS)
 
-/* 半个缓冲的字节数（= 128 帧 × 2 声道 × 4 字节 = 1KB，天然 32 字节对齐倍数） */
-#define SYNTH_AUDIO_HALF_BYTES  ((uint32_t)sizeof(g_audio_buf) / 2u)
+/* 预渲染环形缓冲的块数：3 块 = 8 ms 余量（主循环偶尔被 USB/SD 拖慢也不会欠载）。
+   放 AXI SRAM（.ram_section）：DMA 访问不到 DTCM；这里的读写全由 CPU 完成，
+   进 DMA 之前才做 D-Cache 写回。 */
+#define SYNTH_AUDIO_RING_BLOCKS 3u
 
-static inline void audio_clean(const int32_t *half_buf) {
-    SCB_CleanDCache_by_Addr((uint32_t *)(uintptr_t)half_buf, (int32_t)SYNTH_AUDIO_HALF_BYTES);
-}
+static int32_t SYNTH_PORT_AUDIO_RAM
+    g_ring[SYNTH_AUDIO_RING_BLOCKS][SYNTH_AUDIO_BLOCK_WORDS] __attribute__((aligned(32)));
+static int32_t SYNTH_PORT_AUDIO_RAM
+    g_dma_buf[2u * SYNTH_AUDIO_BLOCK_WORDS] __attribute__((aligned(32)));
 
-volatile uint32_t g_synth_audio_xruns = 0u;
+/* 单生产者（主循环）/ 单消费者（音频中断）环形缓冲。
+   g_ring_w 只由主循环写，g_ring_r 只由中断写，所以不需要关中断。 */
+static volatile uint32_t g_ring_w = 0u;
+static volatile uint32_t g_ring_r = 0u;
+
+/* 这几个计数器只被"看板子的人"（tools/status.ps1 用 arm-none-eabi-nm 按名字找符号）和串口日志
+   读，C 代码里可能一个读者都没有。链接带 -fdata-sections + --gc-sections（LTO 下更激进），没人
+   引用的段会被回收 → 符号消失后 status.ps1 报 "ELF 里找不到符号"。
+   保持符号的办法是让 C 代码真的读它们：Core/Src/main.c 的 App_KeepObservablesAlive()。 */
+volatile uint32_t g_synth_audio_xruns = 0u;      /* SAI 报错次数（HAL 回调） */
+volatile uint32_t g_synth_audio_underruns = 0u;  /* 主循环没来得及填：中断重复了上一块 */
 volatile uint32_t g_synth_audio_last_half = 0xFFFFFFFFu;
-/* 存活探针：>0 = 正在音频 DMA 中断里渲染。
-   这个中断是优先级 0（最高），如果渲染卡住（死循环/长时间阻塞），SysTick（优先级 15）会被屏蔽 ——
-   现象就是"整块板像死机"（LED 不闪、USB 不响应），而 loop_count/systick_ticks 都停住。
-   所以它是区分"卡在渲染里"和"卡在主循环里"的关键字段。 */
+/* 存活探针：>0 = 正在音频 DMA 中断里。改架构后这里应该总是短暂为 1；
+   长时间停在 1 说明卡在 memcpy/D-Cache 写回（几乎不可能）。 */
 volatile uint32_t g_synth_audio_isr_depth = 0u;
 
-/* 启动：先填满两个半缓冲，再开循环 DMA。
-   Size 语义 = DMA 传输的“数据项”数（SAI 的 DR 是 32bit，一个立体声帧 = 2 项）。 */
-int synth_port_audio_start(void) {
-    synth_render_i32(&g_audio_buf[0], SYNTH_PORT_BLOCK_FRAMES);
-    audio_clean(&g_audio_buf[0]);
-    synth_render_i32(&g_audio_buf[SYNTH_PORT_BLOCK_FRAMES * SYNTH_PORT_WORDS_PER_FRAME],
-                     SYNTH_PORT_BLOCK_FRAMES);
-    audio_clean(&g_audio_buf[SYNTH_PORT_BLOCK_FRAMES * SYNTH_PORT_WORDS_PER_FRAME]);
+static inline void audio_clean(void *buf, uint32_t bytes) {
+    SCB_CleanDCache_by_Addr((uint32_t *)(uintptr_t)buf, (int32_t)bytes);
+}
 
-    const uint16_t words = (uint16_t)(SYNTH_PORT_BLOCK_FRAMES * 2u * SYNTH_PORT_WORDS_PER_FRAME);
-    if (HAL_SAI_Transmit_DMA(&SYNTH_SAI_HANDLE, (uint8_t *)g_audio_buf, words) != HAL_OK) {
+/* 中断里：从环里取一块填进 DMA 的那个半缓冲；环空就保持原内容（重复上一块）。 */
+static inline void audio_serve_half(int32_t *dst) {
+    const uint32_t r = g_ring_r;
+    if (r != g_ring_w) {
+        memcpy(dst, g_ring[r], SYNTH_AUDIO_BLOCK_BYTES);
+        __DMB();
+        g_ring_r = (r + 1u < SYNTH_AUDIO_RING_BLOCKS) ? (r + 1u) : 0u;
+    } else {
+        ++g_synth_audio_underruns;
+    }
+    audio_clean(dst, SYNTH_AUDIO_BLOCK_BYTES);
+}
+
+/* 主循环调用：环里还有空位就渲染一块。一次只渲染一块（~1-3 ms 的重活），
+   保证每轮循环都能回去处理 USB/串口。 */
+void synth_port_audio_pump(void) {
+    const uint32_t w = g_ring_w;
+    const uint32_t next = (w + 1u < SYNTH_AUDIO_RING_BLOCKS) ? (w + 1u) : 0u;
+    if (next == g_ring_r) return;                     /* 环满：主循环领先了 */
+    synth_render_i32(g_ring[w], SYNTH_PORT_BLOCK_FRAMES);
+    __DMB();                                          /* 数据先落地，再发布写指针 */
+    g_ring_w = next;
+}
+
+int synth_port_audio_start(void) {
+    /* 预填 3 块，再把前两块搬进 DMA 的两个半缓冲，然后开循环 DMA */
+    for (uint32_t i = 0; i < 3u; ++i) synth_port_audio_pump();
+
+    for (uint32_t h = 0; h < 2u; ++h) {
+        int32_t *dst = &g_dma_buf[h * SYNTH_AUDIO_BLOCK_WORDS];
+        const uint32_t r = g_ring_r;
+        memcpy(dst, g_ring[r], SYNTH_AUDIO_BLOCK_BYTES);
+        g_ring_r = (r + 1u < SYNTH_AUDIO_RING_BLOCKS) ? (r + 1u) : 0u;
+        audio_clean(dst, SYNTH_AUDIO_BLOCK_BYTES);
+    }
+
+    const uint16_t words = (uint16_t)(2u * SYNTH_AUDIO_BLOCK_WORDS);
+    if (HAL_SAI_Transmit_DMA(&SYNTH_SAI_HANDLE, (uint8_t *)g_dma_buf, words) != HAL_OK) {
         return -1;
     }
-    dbg_log("sai", "audio DMA started (%u words, %lu Hz)", (unsigned)words, (unsigned long)48000u);
+    dbg_log("sai", "audio DMA started (%u words/半缓冲, 预渲染 %u 块)",
+            (unsigned)SYNTH_AUDIO_BLOCK_WORDS, (unsigned)SYNTH_AUDIO_RING_BLOCKS);
     return 0;
 }
 
@@ -47,13 +104,12 @@ void synth_port_audio_stop(void) {
     (void)HAL_SAI_DMAStop(&SYNTH_SAI_HANDLE);
 }
 
-/* ---- HAL 回调 ---- */
+/* ---- HAL 回调：只搬数据，不渲染 ---- */
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
     if (hsai == &SYNTH_SAI_HANDLE) {
         g_synth_audio_last_half = 0u;
-        ++g_synth_audio_isr_depth;          /* 卡死时这里会一直是 1（见文件顶部说明） */
-        synth_render_i32(&g_audio_buf[0], SYNTH_PORT_BLOCK_FRAMES);
-        audio_clean(&g_audio_buf[0]);       /* D-Cache 写回，否则 DMA 送出的是旧数据 */
+        ++g_synth_audio_isr_depth;
+        audio_serve_half(&g_dma_buf[0]);
         --g_synth_audio_isr_depth;
     }
 }
@@ -62,9 +118,7 @@ void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
     if (hsai == &SYNTH_SAI_HANDLE) {
         g_synth_audio_last_half = 1u;
         ++g_synth_audio_isr_depth;
-        synth_render_i32(&g_audio_buf[SYNTH_PORT_BLOCK_FRAMES * SYNTH_PORT_WORDS_PER_FRAME],
-                         SYNTH_PORT_BLOCK_FRAMES);
-        audio_clean(&g_audio_buf[SYNTH_PORT_BLOCK_FRAMES * SYNTH_PORT_WORDS_PER_FRAME]);
+        audio_serve_half(&g_dma_buf[SYNTH_AUDIO_BLOCK_WORDS]);
         --g_synth_audio_isr_depth;
     }
 }

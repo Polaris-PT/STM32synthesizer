@@ -128,9 +128,9 @@ cmake --build build-mingw -j 8          # → build-mingw/STM32synthesizer.elf
    powershell -NoProfile -ExecutionPolicy Bypass -File tools\status.ps1    # 或 VS Code 任务"读取板子状态"
    ```
 
-   它读回 `g_app_status`（**28 个 u32**）+ `g_synth_audio_xruns` + `g_synth_midi_rx_bytes`，解码成表，
-   并打印故障位、复位原因（`RCC->RSR`）、**USB 寄存器判读**和一句结论。
-   ⚠ 不要手敲固定地址的 `mdw`：重编译后地址会变（本次 `g_app_status` 在 `0x240000BC`）。
+   它读回 `g_app_status`（**32 个 u32**）+ `g_synth_audio_xruns` + `g_synth_midi_rx_bytes`，解码成表，
+   并打印故障位、复位原因（`RCC->RSR`）、**USB 寄存器判读**、**存活探针**和一句结论。
+   ⚠ 不要手敲固定地址的 `mdw`：重编译后地址会变（本次 `g_app_status` 在 `0x240000CC`）。
    要用符号就 `arm-none-eabi-nm -S build\RelWithDebInfo\STM32synthesizer.elf | Select-String g_app_status`。
    （脚本读的时候 CPU 会短暂 halt，主机可能因此认为 USB 掉线一次 —— 所以判断
    `usb_umount_count` 要先读一次作基线，再看后续是否增长。）
@@ -148,6 +148,7 @@ cmake --build build-mingw -j 8          # → build-mingw/STM32synthesizer.elf
    | +0x44 / +0x48 / +0x4C | usb_irq_count / usb_sel / usb_clk_rc | >0（插着线）/ 1 / 0 |
    | +0x50 / +0x54 / +0x58 / +0x5C | usb_gotgctl / usb_gintsts / usb_dctl / usb_dsts | 见第 6 节第 9 条 |
    | +0x60 / +0x64 / +0x68 / +0x6C | usb_gccfg / usb_gusbcfg / usb_dcfg / loop_count | PWRDWN=1 / PHYSEL=1 / DSPD=3 / 持续涨 |
+   | +0x70 / +0x74 / +0x78 / +0x7C | systick_ticks / main_stage / usb_isr_depth / audio_isr_depth | 1 kHz 持续涨 / 1=usb_task 2=patch_service 3=synth_service 0=其它 / 正常时 0 / 正常时 0 |
 
    **PE3 心跳灯**（`App_LedTask`，不接调试器也能看）：100 ms 快闪 = 有故障位；
    1 Hz 慢闪 = 主循环在跑但 USB 未枚举；**每 2 秒一次短脉冲 = 一切正常**。
@@ -250,7 +251,53 @@ return tu_le16toh(v) & 0x7FF;
 `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_CAFE&PID_4020\0001` → "USB Composite Device"/`usbccgp`，
 子节点 `…&MI_00` → "USB Audio Device"/`usbaudio`，两者都没有 `Problem` 值。
 
-⚠ 仍待修：`App_FindFaultFrame()` 从 `MSP` 起扫「xPSR.T=1 且 IPSR≠0」的帧，但
-`HardFault_Handler` 的 C 前导先 `push {r3, lr}` 再 `bl App_HardFaultRecord` —— 真正的
-`EXC_RETURN` 在 `[MSP+4]`、栈帧从 `[MSP+8]` 开始，所以 `frame_valid` 常为 0。改法：按
-`(v & 0xFFFFFFE0) == 0xFFFFFFE0` 找 `EXC_RETURN`，或直接取 `MSP+8`。
+✅ 已修（2026-10-19）：`App_HardFaultRecord` 的 naked 序言改成 `mrs r1,msp` + `ldr r0,[r1,#4]`
+—— 在 C 函数里 `mov r0,lr` 拿到的是 `bl` 的返回地址，不是 `EXC_RETURN`。同时
+`App_FindFaultFrame()` 不再要求「IPSR≠0」（线程模式出事时 IPSR 就是 0），只校验 `xPSR.T=1`
+且 `PC` 落在 flash。实测抓到 `EXC_RETURN=0xFFFFFFE9`、`PC=0x080035E6`（线程模式、主循环渲染时崩）。
+
+## 10. 切音色必崩（UNALIGNED）：`synth_patch_t` 只有 1 字节对齐
+
+现象：上位机点「切换音色」（Program Change）→ 板子立刻卡死（PE3 三短一长闪灯、声音停、
+USB 不再响应）。`tools\status.ps1` 读到 `g_fault.count=1`、`CFSR=0x01000000`（UNALIGNED）、
+`HFSR=0x40000000`（FORCED）。
+
+定位过程（不接调试器也能做）：
+1. openocd `dump_image` 从 `g_fault.msp` 起 256 B → `[MSP+4]=0xFFFFFFE9`（EXC_RETURN）、
+   `[MSP+8..]` = r0/r1/r2/r3/r12/lr/pc/xpsr → **PC = 0x080035E6**。
+2. `arm-none-eabi-addr2line -f -C -e <elf> 0x080035E6` → `RenderBlock(...)`，源码位置
+   `Synth/src/core/engine.cpp:106`（`ApplyPatchIndex()` 被内联进来了）。
+3. `objdump -d` 该处：`movs r3,#53`（= `sizeof(synth_patch_t)`）+ `mla r5,r3,r8,r5` +
+   `ldr r0,[r5,#0]` —— 结构体整块拷贝用的是**字**访问，而 `e.bank[5]` 的地址是 `bank+265`（奇数）。
+
+根因：`synth_patch_t` 的成员全是 `uint8_t/int8_t` + `char name[16]` ⇒ `sizeof = 53`（奇数）、
+对齐 = 1。数组第 N 个元素地址 = `bank + 53N`，N 为奇数时落在奇数地址；`e.patch = e.bank[idx]`
+这种结构体赋值被 GCC 展开成 `ldr/str` 整字拷贝，而 **Cortex-M7 不支持非对齐字访问** →
+UsageFault(UNALIGNED) → 升级成 HardFault。所以 PC 0 正常、PC 1/3/5…（53N 为奇数）必崩。
+
+修复（两处，缺一不可）：
+1. `Synth/include/synth/patch.h`：`} __attribute__((aligned(4))) synth_patch_t;`
+   —— `sizeof` 自动补到 56，数组每个元素都 4 字节对齐。
+2. `Synth/src/core/engine.cpp`：两处结构体赋值改成 `memcpy()`
+   （`:106` `e.patch = e.bank[idx]`、`:305` `e.patch = *rpp`）—— 外部传入的 patch 指针
+   （`.syn` 文本解析出的缓冲区）不保证对齐，`memcpy` 对非对齐源是安全的。
+
+验证（上板实测）：15 个音色全扫 + 400 条随机 MIDI + 240 条 NRPN + 15 轮满 polyphony 快速切音色
+→ `fault=0`、`midi_rx=3025`、`loop_count` 持续增长、`g_fault.magic=0`。
+
+⚠ 通用判据：**任何 `sizeof` 不是 4 的倍数的结构体，都不要整体赋值/按值传参**（GCC 会生成字访问）；
+要么加 `aligned(4)`，要么一律 `memcpy`。本工程已踩两次：USB 端点描述符的 `wMaxPacketSize`
+（奇数偏移）和这次的 `synth_patch_t`。
+
+## 11. MIDI 解析加固（2026-10-19）
+
+`Synth/src/midi/midi_parser.h` 原来把 `0xF1/0xF2/0xF3` 一律当 2 个数据字节，且让它们建立
+running status —— 收到 MTC Quarter Frame/Song Select 后会多吃一个字节、后续数据字节被错解。
+现在：
+- 系统公共消息按真实长度解析（`0xF1`=1、`0xF2`=2、`0xF3`=1、`0xF6`=0），且**不建立 running status**；
+- `0xF4/0xF5` 这类未定义消息直接丢弃并计数；
+- 新增 `stray_bytes`（无状态字节的数据字节）与 `dropped_common` 计数，便于排查错位流；
+- SysEx 仍整体丢弃（本工程不需要，`synth_load_fm_sysex()` 是 C API，不走 MIDI 输入）。
+
+验证：发 `0xF1 0x40`、`0xF2 0x10 0x02`、`0xF3 0x07`、`0xF6`、`0xF8`、`0xFA`、`0xFC`、`0xFE`
+与一个孤立数据字节 `0x40`，随后一条正常 note on/off 仍正常、`fault=0`。

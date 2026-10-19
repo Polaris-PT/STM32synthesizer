@@ -34,10 +34,15 @@
 .PARAMETER NoSize
     跳过内存占用汇总。
 
+.PARAMETER Trim
+    发布裁剪：关掉调试串口日志（SYNTH_PORT_DEBUG_UART=0），诊断字符串不再进 flash，
+    同时 Core/Src 与"冷"端口层文件用 -Os 编译。实测省 ~4.7 KB。
+    （LTO 试过能再省 ~4 KB，但会把 HAL 的 __weak MspInit 覆盖顶掉，已放弃 —— 见 CMakeLists.txt 里的记录。）
+
 .EXAMPLE
     pwsh tools/build.ps1
     pwsh tools/build.ps1 -BuildType Debug -Clean
-    pwsh tools/build.ps1 -Flash
+    pwsh tools/build.ps1 -Trim -Flash           # 发布版：flash 最省，但没有串口日志
 #>
 [CmdletBinding()]
 param(
@@ -49,7 +54,8 @@ param(
     [int]$Jobs = 0,
     [switch]$Clean,
     [switch]$Flash,
-    [switch]$NoSize
+    [switch]$NoSize,
+    [switch]$Trim
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,6 +140,9 @@ $configureArgs = @(
     '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE'
 )
 if ($useToolchainArg) { $configureArgs += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile" }
+# 两个选项每次都显式传（ON/OFF 都传）：只传 ON 的话，上一次 -Trim 的结果会留在缓存里，
+# 下次不带 -Trim 构建时仍然是裁剪版，很容易把人搞糊涂。
+$configureArgs += "-DSYNTH_RELEASE:BOOL=" + $Trim.IsPresent.ToString().ToUpper()
 & $cmake @configureArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake 配置失败（exit $LASTEXITCODE）" }
 

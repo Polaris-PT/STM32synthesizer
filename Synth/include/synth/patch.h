@@ -95,7 +95,11 @@ typedef struct {
     uint8_t fm_voice;
 
     char    name[SYNTH_PATCH_NAME_LEN];
-} synth_patch_t;
+} __attribute__((aligned(4))) synth_patch_t;
+/* aligned(4) 是必须的：结构体成员全是 1 字节（sizeof = 53），原先对齐只有 1，数组第 5 个元素
+   就落在奇数地址；任何 `a = bank[i]` 的结构体赋值都会被 GCC 展开成 ldr/str 整字拷贝，
+   而 Cortex-M7 不支持非对齐字访问 → UNALIGNED UsageFault → HardFault（切音色必崩）。
+   加了对齐后 sizeof 自动补到 56，数组每个元素都 4 字节对齐，整块拷贝也安全。 */
 
 extern const synth_patch_t synth_factory_bank[];
 extern const uint16_t      synth_factory_bank_size;

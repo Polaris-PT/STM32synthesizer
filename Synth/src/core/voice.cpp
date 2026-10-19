@@ -21,7 +21,9 @@ void Voice::Reset() {
 }
 
 void Voice::NoteOn(uint8_t note, uint8_t velocity, const synth_patch_t &p,
-                   bool retrigger, float prev_hz, bool glide) {
+                   bool retrigger, float prev_hz, bool glide, uint8_t channel) {
+    chan_ = channel;
+    memcpy(&patch_, &p, sizeof(patch_));    /* 音色快照：之后这个音一直用它，不受其它通道影响 */
     note_  = note;
     vel_   = velocity;
     vel01_ = clampf((float)velocity * (1.0f / 127.0f), 0.0f, 1.0f);
@@ -127,7 +129,6 @@ void Voice::UpdateControl(const synth_patch_t &p, const GlobalParams &g, uint32_
         base *= exp2f(lfo_val_ * depth * 2.0f * (1.0f / 12.0f));        /* 最多 ±2 半音 */
     }
     base *= exp2f(g.bend * SYNTH_BEND_SEMITONES * (1.0f / 12.0f));
-
     osc1_.SetFreq(base, sr_);
     osc2_.SetFreq(base * ratio2_, sr_);
     if (p.sub_level) sub_.SetFreq(base * 0.5f, sr_);
@@ -156,7 +157,8 @@ void Voice::UpdateControl(const synth_patch_t &p, const GlobalParams &g, uint32_
     filter_.SetCoeffs(cut, res, sr_, p.filter_type);
 }
 
-void Voice::Render(float *out_lr, uint32_t frames, const synth_patch_t &p, const GlobalParams &g) {
+void Voice::Render(float *out_lr, uint32_t frames, const GlobalParams &g) {
+    const synth_patch_t &p = patch_;        /* 用自己的音色快照，而不是全局 e.patch */
     if (!amp_.Active() && steal_left_ == 0) return;
 
     uint32_t done = 0;
@@ -171,12 +173,11 @@ void Voice::Render(float *out_lr, uint32_t frames, const synth_patch_t &p, const
         for (uint32_t i = 0; i < chunk; ++i) {
             const float aenv = amp_.Process();
             float sig = osc1_lvl_ * osc1_.Next(pw1_)
-                      + osc2_lvl_ * osc2_.Next(pw2_)
-                      + sub_lvl_   * sub_.Saw()
-                      + noise_lvl_ * noise_rng_.Next();
-            if (noise_lvl_ <= 0.0f && sub_lvl_ <= 0.0f) {
-                /* 无噪声/子振时保持相位推进一致性由上面分支已处理 */
-            }
+                      + osc2_lvl_ * osc2_.Next(pw2_);
+            /* 子振/噪声按需计算：默认音色这两项是 0，但原来每样点都在算
+               （噪声还得推进 LCG），16 声部 128 帧 = 2048 次白算。 */
+            if (sub_lvl_ > 0.0f)   sig += sub_lvl_ * sub_.Saw();
+            if (noise_lvl_ > 0.0f) sig += noise_lvl_ * noise_rng_.Next();
             float y = filter_.Process(sig);
             float out = y * aenv * amp_gain_ * lfo_amp_gain;
             if (steal_left_ > 0) {

@@ -2,6 +2,8 @@
 #ifndef SSYNTH_VOICE_H
 #define SSYNTH_VOICE_H
 
+#include <string.h>
+
 #include "dsp_util.h"
 #include "osc.h"
 #include "filter.h"
@@ -33,20 +35,30 @@ public:
     void     SetAge(uint32_t a) { age_ = a; }
     void     AdvanceAge() { if (age_ < 0xFFFFFFF0u) ++age_; }
 
+    /* channel：本声部归属的 MIDI 通道；声部保存一份音色快照，渲染时用自己的那份，
+       这样同一声部池里可以同时存在不同通道、不同音色的音（多音色）。 */
     void NoteOn(uint8_t note, uint8_t velocity, const synth_patch_t &p,
-                bool retrigger, float prev_hz, bool glide);
+                bool retrigger, float prev_hz, bool glide, uint8_t channel = 0);
     void NoteOff();
     void Kill();
     void BeginSteal(uint32_t frames);       /* 从当前电平淡出到 0，然后转为 idle */
     bool Stealing() const { return steal_left_ > 0; }
 
-    void Render(float *out_lr, uint32_t frames, const synth_patch_t &p, const GlobalParams &g);
+    uint8_t Channel() const { return chan_; }
+    void    SetPatch(const synth_patch_t &p) { memcpy(&patch_, &p, sizeof(patch_)); }
+
+    void Render(float *out_lr, uint32_t frames, const GlobalParams &g);
 
 private:
     void UpdateControl(const synth_patch_t &p, const GlobalParams &g, uint32_t chunk);
 
-    static constexpr uint32_t kCtrlRate = 8;   /* 控制率分块（样点） */
+    static constexpr uint32_t kCtrlRate = 32;  /* 控制率分块（样点）：32 → 1.5 kHz。
+                                                  UpdateControl 里有 exp2f/tanf/sqrtf，原来 8 样点
+                                                  一次（6 kHz）在 M7 上是纯浪费：16 声部时这一项
+                                                  就吃掉一成多实时预算。 */
 
+    synth_patch_t patch_{};     /* 本声部自己的音色快照（按通道映射） */
+    uint8_t  chan_      = 0;
     float    sr_        = 48000.0f;
     uint8_t  note_      = 69;
     uint8_t  vel_       = 100;

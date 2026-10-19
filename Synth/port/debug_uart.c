@@ -163,34 +163,6 @@ void dbg_printf(const char *fmt, ...)
   dbg_write(line, ((uint32_t)n < sizeof(line)) ? (uint32_t)n : (uint32_t)(sizeof(line) - 1u));
 }
 
-void dbg_hex(const uint8_t *p, uint32_t n)
-{
-  char line[DBG_LOG_LINE_MAX];
-  uint32_t pos = 0u;
-
-  if (p == NULL) {
-    return;
-  }
-  for (uint32_t i = 0u; (i < n) && (pos + 4u < sizeof(line)); ++i) {
-    static const char hex[] = "0123456789ABCDEF";
-    line[pos++] = hex[(p[i] >> 4) & 0x0Fu];
-    line[pos++] = hex[p[i] & 0x0Fu];
-    line[pos++] = ' ';
-  }
-  dbg_write(line, pos);
-}
-
-uint32_t dbg_take_dropped(void)
-{
-  uint32_t primask;
-  dbg_irq_mask(&primask);
-  const uint32_t d = s_dropped;
-  s_dropped = 0u;
-  g_dbg_dropped_bytes = 0u;
-  dbg_irq_unmask(primask);
-  return d;
-}
-
 /* ── 日志封装 ─────────────────────────────────────────────────────────────── */
 
 void dbg_log(const char *tag, const char *fmt, ...)
@@ -247,12 +219,5 @@ int _write(int file, char *ptr, int len)
   return len;
 }
 
-#else /* SYNTH_PORT_DEBUG_UART == 0 */
-
-void dbg_log(const char *tag, const char *fmt, ...)
-{
-  (void)tag;
-  (void)fmt;
-}
-
-#endif /* SYNTH_PORT_DEBUG_UART */
+#endif /* SYNTH_PORT_DEBUG_UART —— 关闭时本文件编译为空：
+          dbg_log 在 debug_uart.h 里是空宏，调用点连同格式字符串一起消失 */

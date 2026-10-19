@@ -15,6 +15,9 @@ void synth_port_init(void);
 /* 2. SAI3 Block B 循环 DMA 启动（内部先填满两个半缓冲） */
 int  synth_port_audio_start(void);
 void synth_port_audio_stop(void);
+/* 2b. 主循环每轮调一次：预渲染环有空位就渲染一块。渲染绝不能放在音频中断里
+       （128 帧 @48 kHz 只有 2.667 ms，复音一多就会撑爆优先级 0 的中断 → 断续/丢 MIDI） */
+void synth_port_audio_pump(void);
 
 /* 3. USB MIDI（TinyUSB）：初始化一次，主循环里轮询 task */
 int  synth_port_usb_init(void);
@@ -25,6 +28,10 @@ int  synth_port_sd_mount(void);
 void synth_port_patch_service(void);
 int  synth_port_patch_load_file(const char *path);
 int  synth_port_patch_save_file(uint16_t index, const synth_patch_t *p);
+/* 挂载成功后跑一次的读写自检 + 内置音色导出（把 15 个内置音色写成 /synth/NNN.syn 模板，
+   已存在的文件不覆盖）。返回位图，含义见 patch_storage_sd.c 顶部注释。 */
+uint32_t synth_port_sd_selftest(void);
+uint32_t synth_port_sd_exported(void);   /* 本次新写出几个文件（新卡首启 = 15，之后 = 0） */
 
 /* 5. 阶段 3：ROMpler 采样（16bit PCM WAV → RAM 池） */
 void     synth_port_sample_pool_reset(void);
@@ -45,6 +52,7 @@ void     synth_port_sample_qspi_activate(const char *name);
 
 /* 诊断计数 */
 extern volatile uint32_t g_synth_audio_xruns;   /* 音频 DMA 欠载次数（0 = 健康） */
+extern volatile uint32_t g_synth_audio_underruns; /* 预渲染环没填上、中断重复上一块的次数 */
 extern volatile uint32_t g_synth_midi_rx_bytes; /* USB-MIDI 收到的字节数（弹键就涨） */
 extern volatile uint32_t g_synth_usb_mount_count;  /* 主机完成枚举的次数（反复增长 = 主机在反复重枚举） */
 extern volatile uint32_t g_synth_usb_umount_count; /* USB 掉线次数 */

@@ -316,7 +316,20 @@ for ($i = 0; $i -lt $faultNames.Count; $i++) {
 }
 Write-Host ("  {0,-18} {1}" -f 'synth_init', (To-I32 $v[7]))
 Write-Host ("  {0,-18} {1}" -f 'usb_init', (To-I32 $v[8]))
-Write-Host ("  {0,-18} {1}   (-1 = SD 功能没编进来)" -f 'sd_mount', (To-I32 $v[9]))
+    $sdv = To-I32 $v[9]
+    $sdText = switch ($sdv) {
+        0  { '已挂载并跑过自检' }
+        -1 { 'SD 功能没编进来（SYNTH_PORT_SD_ENABLE = 0）' }
+        -3 { '卡初始化失败（没插卡 / 接触 / 卡座问题）' }
+        1  { 'FR_DISK_ERR：底层读写错（接线/驱动）' }
+        3  { 'FR_NOT_READY：卡没准备好' }
+        11 { 'FR_INVALID_DRIVE：驱动没登记' }
+        12 { 'FR_NOT_ENABLED：逻辑驱动器没挂载' }
+        13 { 'FR_NO_FILESYSTEM：卡通了但文件系统不认（多半是 exFAT，本固件只支持 FAT12/16/32）' }
+        15 { 'FR_TIMEOUT' }
+        default { "FatFs FRESULT = $sdv" }
+    }
+    Write-Host ("  {0,-18} {1}   ({2})" -f 'sd_mount', $sdv, $sdText)
 Write-Host ("  {0,-18} {1}" -f 'audio_start', (To-I32 $v[10]))
 Write-Host ("  {0,-18} {1}   (1 = 主机已枚举完成)" -f 'usb_mounted', $v[11])
 Write-Host ("  {0,-18} {1}   (弹键就涨)" -f 'midi_rx_bytes', $v[12])
@@ -373,6 +386,85 @@ Write-Host ("  {0,-18} {1}   (1 kHz；不涨 = CPU 卡在优先级 0 的中断�
 Write-Host ("  {0,-18} {1}   ({2})" -f 'main_stage', $stage, $stageName)
 Write-Host ("  {0,-18} {1}   (>0 = halt 那一刻正在 USB 中断里)" -f 'usb_isr_depth', $usbDepth)
 Write-Host ("  {0,-18} {1}   (>0 = 正在音频 DMA 中断里渲染)" -f 'audio_isr_depth', $audDepth)
+
+# ---- 负载指标（索引 32..34）：判断"复音一多就滋滋/卡死"还剩多少余量 ----
+if ($words -ge 35) {
+    $cpuPermille = $v[32]
+    $peakCycles  = $v[33]
+    $underruns   = $v[34]
+    $budgetCyc   = 1280000   # 128 帧 @48 kHz = 2.667 ms；480 MHz 下约 1.28M 周期
+    $peakPct     = if ($budgetCyc -gt 0) { [math]::Round(100.0 * $peakCycles / $budgetCyc, 1) } else { 0 }
+
+    Write-Host ''
+    Write-Host '负载（音频渲染余量）' -ForegroundColor White
+    Write-Host ("  {0,-18} {1} ‰   ({2}%)   (1000 = 用满实时预算；>600 就没余量了)" -f `
+        'cpu_permille', $cpuPermille, [math]::Round($cpuPermille / 10.0, 1))
+    Write-Host ("  {0,-18} {1}   ({2}% 的 {3} 周期预算；接近 100% 必定欠载)" -f `
+        'render_peak_cycles', $peakCycles, $peakPct, $budgetCyc)
+    Write-Host ("  {0,-18} {1}   (>0 = 主循环没喂上，音频中断重复了上一块)" -f 'audio_underruns', $underruns)
+}
+
+# ---- 多音色：16 个通道各自的音色号（索引 35..38，每通道 4 bit；15 = 未知）----
+if ($words -ge 39) {
+    $patchNames = @('Init Saw','Warm Pad','Bright Lead','Sub Bass','Pluck','Square Keys','Super Saw',
+                    'Sine Flute','PWM Strings','Res Sweep','Noise Sweep','Organ',
+                    'FM E.Piano','FM Bass','FM Bell')
+    $cps = @()
+    for ($ch = 0; $ch -lt 16; $ch++) {
+        $w = $v[35 + [int][math]::Floor($ch / 4)]
+        $p = ($w -shr (4 * ($ch % 4))) -band 0xF
+        if ($p -eq 0 -or $p -gt 14) { continue }   # 0 = Init Saw（默认，不列）
+        $nm = if ($p -lt $patchNames.Count) { $patchNames[$p] } else { '?' }
+        $cps += ("ch{0}=PC{1}({2})" -f $ch, $p, $nm)
+    }
+    Write-Host ''
+    Write-Host '多音色（每通道音色；只列非默认的通道）' -ForegroundColor White
+    if ($cps.Count -eq 0) {
+        Write-Host '  · 16 个通道都是 0（Init Saw）—— 发 Program Change 后这里会显示各通道音色号'
+    } else {
+        Write-Host ('  ' + ($cps -join '   '))
+    }
+}
+
+# ---- SD 卡自检（索引 39 = sd_selftest 位图，40 = sd_exported 本次新写出的文件数）----
+if ($words -ge 41) {
+    $st = [uint32]$v[39]
+    $exp = To-I32 $v[40]
+    $bits = @()
+    if ($st -band 0x01) { $bits += '目录OK' }
+    if ($st -band 0x02) { $bits += '写入OK' }
+    if ($st -band 0x04) { $bits += '读回OK' }
+    if ($st -band 0x08) { $bits += '解析OK' }
+    if ($st -band 0x10) { $bits += '卡上已有文件(未覆盖)' }
+    if ($st -band 0x20) { $bits += '加载路径OK' }
+    Write-Host ''
+    Write-Host 'SD 卡自检（挂载成功后跑一次；新卡首启应为 目录OK/写入OK/读回OK/解析OK，导出 15 个）' -ForegroundColor White
+    Write-Host ("  sd_selftest       0x{0:X2}   {1}" -f $st, $(if ($bits.Count) { $bits -join ' / ' } else { '未挂载或全部失败' }))
+    Write-Host ("  sd_exported       {0}   (本次新写出 /synth/NNN.syn 的个数；新卡首启 15，之后 0)" -f $exp)
+    if ($words -ge 42) {
+        $d3 = [uint32]$v[41]
+        $d3Text = if ($d3 -eq 1) { '1 = 历史值：曾把 DAT3 当 GPIO 顶高（会和 4-bit 传输抢线，已废弃）' }
+                  else { '0 = DAT3 已交回 SDMMC 外设（4-bit 正常，当前设计）' }
+        Write-Host ("  sd_dat3           {0}   ({1})" -f $d3, $d3Text)
+    }
+    if ($words -ge 43) {
+        $se = [uint32]$v[42]
+        $seBits = @()
+        if ($se -band 1)   { $seBits += 'CMD_CRC_FAIL' }
+        if ($se -band 2)   { $seBits += 'DATA_CRC_FAIL' }
+        if ($se -band 4)   { $seBits += 'CMD_RSP_TIMEOUT(卡不应答)' }
+        if ($se -band 8)   { $seBits += 'DATA_TIMEOUT' }
+        if ($se -band 16)  { $seBits += 'TX_UNDERRUN' }
+        if ($se -band 32)  { $seBits += 'RX_OVERRUN(读数据跟不上/时钟太快)' }
+        if ($se -band 64)  { $seBits += 'ADDR_OUT_OF_RANGE' }
+        if ($se -band 128) { $seBits += 'REQUEST_NOT_APPLICABLE' }
+        if ($se -band 256) { $seBits += 'PARAM' }
+        if ($se -band 512) { $seBits += 'UNSUPPORTED_FEATURE' }
+        if ($se -band 2048){ $seBits += 'IDMA_ERROR(缓冲区地址/对齐)' }
+        $seText = if ($seBits.Count) { $seBits -join ' | ' } else { '无' }
+        Write-Host ("  sd_err            0x{0:X}   (hsd1.ErrorCode: {1})" -f $se, $seText)
+    }
+}
 
 # ---- HardFault 现场（g_fault，由 Core/Src/main.c 的 App_HardFaultRecord() 写入）----
 if ($fv -and $fv.Count -ge 20) {
@@ -441,7 +533,7 @@ if ($rst -band (1 -shl 21)) { $problems += '  出现过 BORRSTF（欠压）→ �
 if ($rst -band (1 -shl 26) -or $rst -band (1 -shl 28)) { $problems += '  出现过看门狗复位（IWDG/WWDG）' }
 $notes = @()
 $notes += '死活判定：间隔 5 秒连读两次 —— systick_ticks 不涨 = CPU 卡在优先级 0 的中断里（或 Error_Handler）；systick 涨但 loop_count 不涨 = 主循环卡在 main_stage 那一步；两者都涨 = 固件活着'
-if ($rst -band (1 -shl 24)) { $notes += '上次复位是 SFTRSTF（软件复位）：HardFault 钩子 NVIC_SystemReset() 和 openocd 的 reset 都会留下这一位，单独出现不算故障' }
+if ($rst -band (1 -shl 24)) { $notes += '上次复位是 SFTRSTF（软件复位）：NVIC_SystemReset()（HardFault 策略 SYNTH_PORT_FAULT_RESET=1 时）和 openocd 的 reset 都会留下这一位，单独出现不算故障' }
 # ⚠ boot_count 不能只看数字：烧写（openocd 的 reset）和按复位键都会让它 +1。
 #    判断复位循环的正确做法：不烧写、不按复位，连读两次，只有两次之间增长才是循环。
 Write-Host ("  · boot_count = {0}：烧写/按复位键都会 +1；判断复位循环要「不烧写不复位连读两次看是否增长」" -f $v[13])
@@ -467,6 +559,10 @@ if ($v[16] -gt 0)         { $problems += "usb_umount_count = $($v[16])：USB 掉
 if ($v[15] -gt 1)         { $problems += "usb_mount_count = $($v[15])：主机枚举过多次（反复重枚举）" }
 if ($v[15] -eq 0 -and $usbIrq -gt 0) { $problems += 'usb_mount_count = 0 但中断有：核在跑却没谈成（描述符/端点/主机侧）' }
 if ($audDepth -gt 0)      { $problems += 'audio_isr_depth > 0：正卡在音频 DMA 中断的渲染里 —— 该中断优先级 0，会屏蔽 SysTick，现象就是「板子像死机」；连读两次都是 1 = 卡死在渲染里' }
+if ($words -ge 35) {
+    if ($v[34] -gt 0)  { $problems += ("audio_underruns = {0}：主循环喂不上预渲染环（CPU 忙不过来，或被 SD/阻塞调用卡住）" -f $v[34]) }
+    if ($v[32] -gt 700) { $problems += ("cpu_permille = {0}‰：渲染已吃掉 7 成以上预算，复音再多就会断续" -f $v[32]) }
+}
 if ($usbDepth -gt 0)      { $problems += 'usb_isr_depth > 0：正卡在 USB 中断里（连读两次都是 1 = 卡死在 TinyUSB 中断处理里）' }
 if ($fv -and $fv.Count -ge 20 -and $fv[0] -eq 0x48465A31) {
     $problems += ("进过 HardFault（count = {0}）：CFSR = 0x{1:X8}，出事时 PC = 0x{2:X8} —— 详见上面「HardFault 现场」" -f $fv[1], $fv[2], $fv[16])

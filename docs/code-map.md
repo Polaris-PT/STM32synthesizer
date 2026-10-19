@@ -59,17 +59,20 @@ USB 4 字节事件包
   └─ DrainMidi()                            engine.cpp:285
        └─ MidiParser::Push()                Synth/src/midi/midi_parser.h（running status / SysEx 处理）
             └─ HandleMessage(status, d1, d2) engine.cpp:271
-                 ├─ 0x8n note-off → VoiceNoteOff()   engine.cpp:203
-                 ├─ 0x9n note-on  → VoiceNoteOn()    engine.cpp:172 → AllocateVoice():123（偷音策略）
-                 ├─ 0xBn CC       → ControlChange()  engine.cpp:240（CC1/74/71/7/64/120/123/20-23）
+                 ├─ 0x8n note-off → VoiceNoteOff(e, ch, ...)  engine.cpp:203（查 note_voice[ch][note]）
+                 ├─ 0x9n note-on  → VoiceNoteOn(e, ch, ...)   engine.cpp:172 → AllocateVoice(e, ch, ...):123（偷音策略）
+                 │                  音色取自 e.chan_patch[ch]，抄进 Voice::patch_ 快照
+                 ├─ 0xBn CC       → ControlChange(e, ch, ...) engine.cpp:240（CC5/72/73/76/77/79 改本通道音色并推给在响声部）
+                 ├─ 0xCn PC       → ApplyPatchIndexToChannel(e, ch, n)（只切本通道，越界忽略）
                  └─ 0xF8 clock    → Arp::OnMidiClock()
 渲染（DMA 中断里，每 128 帧）
   └─ RenderBlock(engine, out, frames)        engine.cpp:296
        ├─ Arp::AdvanceBlock()                Synth/src/app/arp.cpp
-       ├─ 16 个 Voice::Render()              Synth/src/core/voice.cpp（OscModel + FilterBlock + 2×Adsr）
-       ├─ 或 FmDx7Engine::Render()           Synth/src/engines/fm_dx7.cpp
-       ├─ 或 Rompler::Render()               Synth/src/core/rompler.cpp
-       └─ FxChain::Process()                 Synth/src/fx/fx_chain.cpp（drive → chorus → delay）
+       ├─ 16 个 Voice::Render(out, frames, g) Synth/src/core/voice.cpp（用自己的 patch_ 快照 +
+       │                                     OscModel + FilterBlock + 2×Adsr）
+       ├─ FmDx7Engine::Render()   仅当 ActiveNotes()>0  Synth/src/engines/fm_dx7.cpp（一次只能载入一条 DX7 音色）
+       ├─ Rompler::Render()       仅当 ActiveNotes()>0  Synth/src/core/rompler.cpp（乐器全局一个）
+       └─ FxChain::Process()                 Synth/src/fx/fx_chain.cpp（全局一条，参数取"主音色" e.patch）
   └─ synth_render_i32()                      engine.cpp:451（float → int32，24 bit 左对齐）
        └─ g_audio_buf（AXI SRAM `.ram_section`，8 KB）
             └─ SAI3_B DMA → I2S → PCM5102A
@@ -77,8 +80,9 @@ USB 4 字节事件包
 
 ## 4. 引擎内部的关键类型
 
-- **`Engine`**（`engine.cpp:39-88`）：全局单例 `g_eng`。持有音色 `patch`、`GlobalParams g`、
-  `Voice voices[16]`、`note_voice[128]`/`note_held[128]`（音符→声部映射、按住状态）、
+- **`Engine`**（`engine.cpp:39-88`）：全局单例 `g_eng`。持有多音色映射 `chan_patch[16]`/`chan_idx[16]`
+  （每 MIDI 通道一个音色；`patch` 是"主音色"，全局 FX 参数取自它）、`GlobalParams g`、
+  `Voice voices[16]`、`note_voice[16][128]`/`note_held[16][128]`（通道 + 音符→声部映射、按住状态）、
   `FxChain fx`、`Arp arp`、`FmDx7Engine fm`、`Rompler rom`、MIDI 环形缓冲、控制线程请求标志
   （`req_patch_index`/`req_panic_flag`/…，主循环写、音频线程读）、`block_buf`。
 - **`Voice`**（`core/voice.h:22`）：一个声部 = `OscModel`（双振荡器：wavetable/SuperSaw/噪声，可 detune）
@@ -101,7 +105,9 @@ USB 4 字节事件包
 
 - `Synth/include/synth/synth.h`：`synth_init/render_i32/midi_in/tick_1ms/service/...`
   + `synth_config_t`（采样率必须 48 kHz）+ `synth_stats_t`（声部数、偷音、丢字节、CPU 周期）
-  + `synth_platform_hooks_t`（`cycles_now`/`cpu_hz`，用于 CPU 占用统计，由端口层安装）。
+  + `synth_platform_hooks_t`（`cycles_now`/`cpu_hz`，用于 CPU 占用统计，由端口层安装）
+  + `synth_set_channel_patch(ch, idx)` / `synth_get_channel_patch(ch)`（多音色：每通道一个音色，
+    越界索引返回 0xFFFF；请求排进队列、音频线程下一块生效）。
 - `Synth/include/synth/patch.h`：`synth_patch_t`（振荡器/滤波/包络/LFO/FX 参数 + 范围常量）、
   `synth_factory_bank[]`（内置音色表）。
 - `Synth/include/synth/sample.h` / `pcm.h`：采样乐器/区/格式。
@@ -141,3 +147,26 @@ USB 4 字节事件包
 - **`g_fault`**（20 个 u32）：HardFault 现场（CFSR/HFSR/BFAR/MMFAR/PC/LR 栈帧），软复位不丢。
 - **PC 端单测**：`host/` + `tests/`，可脱离硬件验证 DSP 与解析器。
 - **构建/烧写/读数**：`tools/build.ps1`、`tools/flash.ps1`、`tools/status.ps1`（都带 UTF-8 BOM，PS 5.1 才不会读乱）。
+
+## 9. 诊断代码清单（可整体删除）
+
+上板排查用的东西都集中在这里，**功能代码不依赖它们**（删掉后固件照常发声）。要减负时按需删：
+
+| 位置 | 内容 | 删的时候注意 |
+| --- | --- | --- |
+| `Core/Src/main.c` PTD/PV | `g_app_status`（32 u32）、`g_fault`（20 u32，在 `.ram_section`） | 一并删 USER CODE 0 里喂它们的函数 |
+| `Core/Src/main.c` USER CODE 0 | `App_RecordBoot` / `App_LedInit` / `App_LedTask` / `App_UsbKernelClockHz` / `App_SnapshotUsb` / `App_CheckSaiClock` / `App_Fault` / `App_HardFaultRecord*` / `App_FindFaultFrame` / `App_FaultBlinkForever` | `App_HardFaultRecordC` 被 `Core/Src/stm32h7xx_it.c` 的 `HardFault_Handler` 调用，要一并删 |
+| `Core/Src/stm32h7xx_it.c` | SysTick 里 `++g_synth_systick_ticks`、OTG_FS 里 `++g_synth_usb_irq_count` | 同文件里的 `OTG_FS_IRQHandler → tud_int_handler(0)` **不是**诊断（USB 必需），别删 |
+| `Synth/port/debug_uart.[ch]` | 串口日志（8 KB 环形缓冲 + 逐字节 IT + 接管 `_write`） | 把 `SYNTH_PORT_DEBUG_UART` 置 0 即可（全变空实现），不必删文件 |
+| `Synth/port/platform_stm32.c` | `g_synth_systick_ticks` / `g_synth_usb_isr_depth` / `g_synth_usb_clk_rc` | 与 main.c 的探针一起删 |
+| `Synth/port/audio_out_sai.c` | `g_synth_audio_isr_depth` / `g_synth_audio_last_half` / XRUN 日志 | 同上 |
+| `Synth/port/usb_midi_tinyusb.c` | `g_synth_midi_rx_bytes` / `g_synth_usb_mount_count` / `g_synth_usb_umount_count` / `g_synth_usb_irq_count` | 同上 |
+| `tools/status.ps1` | PC 侧读回并解码 | 纯脚本，不影响固件 |
+
+三个开关都在 `Synth/port/synth_port_config.h`：
+
+- `SYNTH_PORT_DEBUG_UART`：1 = 串口日志（默认），0 = 空实现（省 flash）
+- `SYNTH_PORT_MIDI_TRACE`：每个 USB-MIDI 事件包打一行（默认 0，查"音停不下来"时开）
+- `SYNTH_PORT_FAULT_RESET`：0 = HardFault 后停住闪灯（默认），1 = 记录完软复位、自动恢复发声
+
+实测成本：诊断 + 串口日志约占 **8~11 KB flash**；`g_app_status` 128 B + `g_fault` 80 B 的 RAM（`.ram_section`）。

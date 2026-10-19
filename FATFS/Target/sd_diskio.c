@@ -148,6 +148,10 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
 
+  /* 本地补丁（CubeMX 重新生成会覆盖，见 docs/handoff.md）：SDMMC 用芯片内部 IDMA
+     直接写 AXI SRAM，绕开 D-Cache —— 不清缓存会读到旧数据（表现为文件内容错乱/FR_INT_ERR）。
+     这里的调用频率是"每扇区一次"，不在音频路径上，整片 clean+invalidate 足够安全。 */
+  SCB_CleanInvalidateDCache();
   if(BSP_SD_ReadBlocks((uint32_t*)buff,
                        (uint32_t) (sector),
                        count, SD_TIMEOUT) == MSD_OK)
@@ -158,6 +162,7 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
     }
     res = RES_OK;
   }
+  SCB_CleanInvalidateDCache();
 
   return res;
 }
@@ -179,6 +184,8 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
 
+  /* 本地补丁：写之前必须把 CPU 写进 D-Cache 的数据清到 SRAM（IDMA 从 SRAM 取数）。 */
+  SCB_CleanInvalidateDCache();
   if(BSP_SD_WriteBlocks((uint32_t*)buff,
                         (uint32_t)(sector),
                         count, SD_TIMEOUT) == MSD_OK)

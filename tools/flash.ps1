@@ -56,10 +56,16 @@ $Root = Split-Path -Parent $PSScriptRoot
 
 # ---------------------------------------------------------------- 找 ELF
 if (-not $Elf) {
-    $cand = Get-ChildItem -Path $Root -Filter 'STM32synthesizer.elf' -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $cand) { throw "没找到 STM32synthesizer.elf，先跑 tools\build.ps1（或直接给我 -Elf 路径）。" }
-    $Elf = $cand.FullName
+    # 优先用 build.ps1 的默认产物（build\<BuildType>）——避免误烧旧构建目录里遗留的 ELF
+    $preferred = Join-Path $Root 'build\RelWithDebInfo\STM32synthesizer.elf'
+    if (Test-Path $preferred) {
+        $Elf = $preferred
+    } else {
+        $cand = Get-ChildItem -Path $Root -Filter 'STM32synthesizer.elf' -Recurse -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $cand) { throw "没找到 STM32synthesizer.elf，先跑 tools\build.ps1（或直接给我 -Elf 路径）。" }
+        $Elf = $cand.FullName
+    }
 }
 elseif (-not [System.IO.Path]::IsPathRooted($Elf)) {
     $Elf = Join-Path $Root $Elf

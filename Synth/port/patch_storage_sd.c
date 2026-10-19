@@ -29,7 +29,10 @@ static int16_t     g_last_request = -1;
 int synth_port_sd_mount(void) {
     const FRESULT fr = f_mount(&g_fs, "0:", 1);
     g_mounted = (fr == FR_OK) ? 1 : 0;
-    return g_mounted ? 0 : -1;
+    /* 失败时把 FatFs 的 FRESULT 原样返回（1 = FR_DISK_ERR、3 = FR_NOT_READY、
+       11 = FR_INVALID_DRIVE、12 = FR_NOT_ENABLED、13 = FR_NO_FILESYSTEM 等），
+       这样 tools/status.ps1 一眼就能看出是"卡通了但文件系统不认"还是"驱动/接线问题"。 */
+    return g_mounted ? 0 : (int)fr;
 }
 
 /* 读取并解析一个音色文件：先按 DX7 .syx（FM）尝试，再按文本音色解析 */
@@ -88,6 +91,77 @@ int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
     return (fr == FR_OK && wrote == (UINT)len) ? 0 : -4;
 }
 
+/* ---------------------------------------------------------------------------
+   SD 读写自检 + 内置音色导出（挂载成功后调用一次，见 Core/Src/main.c 第 9 步）
+
+   目的：一张卡插上去以后，不接 PC 也能知道"目录 / 写通路 / 读通路 / 文本解析"到底行不行；
+        顺便把 15 个内置音色导出成 /synth/NNN.syn 模板 —— **只写不存在的文件**，
+        所以用户在卡上改过的音色不会被开机覆盖掉。
+   返回位图（存进 g_app_status.sd_selftest，用 tools/status.ps1 读）：
+     bit0 目录可用（/synth 已存在或新建成功）
+     bit1 至少写成功一个文件
+     bit2 读回成功（读到的字节数 > 0）
+     bit3 读回的文本能解析成音色（patch_from_text 返回值 > 0 = 解析成功的字段数）
+     bit4 导出时跳过过已存在的文件（= 卡上本来就有东西，没被覆盖）
+     bit5 走真实加载路径（synth_port_patch_load_file("/synth/000.syn")）成功
+   synth_port_sd_exported() 给出本次真正新写出的文件数（新卡第一次上电应为 15，之后为 0）。
+   ⇒ 全部通过应为 0x2F；只要卡上已有文件，bit4 也会亮，所以稳态是 0x3F（bit1 只在本次真写了东西时亮）。
+--------------------------------------------------------------------------- */
+static uint32_t g_sd_selftest = 0u;
+static uint32_t g_sd_exported = 0u;
+
+uint32_t synth_port_sd_selftest(void) {
+    g_sd_selftest = 0u;
+    g_sd_exported = 0u;
+    if (!g_mounted) return g_sd_selftest;
+
+    /* 1) 目录 */
+    const FRESULT fm = f_mkdir(SYNTH_PORT_PATCH_DIR);
+    if (fm == FR_OK || fm == FR_EXIST) {
+        g_sd_selftest |= 0x01u;
+    } else {
+        return g_sd_selftest;              /* 目录都建不了，后面没必要试 */
+    }
+
+    /* 2) 导出内置音色模板（已存在的不覆盖） */
+    for (uint32_t i = 0u; i < (uint32_t)synth_factory_bank_size; ++i) {
+        char path[64];
+        snprintf(path, sizeof(path), SYNTH_PORT_PATCH_DIR "/%03u.syn", (unsigned)i);
+
+        FIL probe;
+        if (f_open(&probe, path, FA_READ) == FR_OK) {
+            f_close(&probe);
+            g_sd_selftest |= 0x10u;        /* 已有这个文件 → 记录"没覆盖" */
+            continue;
+        }
+        if (synth_port_patch_save_file((uint16_t)i, &synth_factory_bank[i]) == 0) {
+            ++g_sd_exported;
+            g_sd_selftest |= 0x02u;
+        }
+    }
+
+    /* 3) 读回自检：000.syn 读出来、解析一遍 */
+    if (f_open(&g_file, SYNTH_PORT_PATCH_DIR "/000.syn", FA_READ) != FR_OK) return g_sd_selftest;
+    UINT got = 0u;
+    const FRESULT fr = f_read(&g_file, g_text, sizeof(g_text) - 1u, &got);
+    f_close(&g_file);
+    if (fr != FR_OK || got == 0u) return g_sd_selftest;
+    g_sd_selftest |= 0x04u;
+
+    g_text[got < sizeof(g_text) ? got : sizeof(g_text) - 1u] = '\0';
+    synth_patch_t tmp;
+    patch_set_defaults(&tmp);
+    /* 注意 patch_from_text() 成功时返回的是"解析成功的字段个数"（>0），不是 0（0 只可能是空文件）。 */
+    const int parsed = patch_from_text(g_text, &tmp);
+    if (parsed > 0) g_sd_selftest |= 0x08u;
+
+    /* 4) 走一遍真正的加载路径（发 PC 切音色时引擎走的就是这个函数） */
+    if (synth_port_patch_load_file(SYNTH_PORT_PATCH_DIR "/000.syn") == 0) g_sd_selftest |= 0x20u;
+    return g_sd_selftest;
+}
+
+uint32_t synth_port_sd_exported(void) { return g_sd_exported; }
+
 #else /* !SYNTH_PORT_SD_ENABLE —— 未启用 FatFs：全部退化为“无卡”行为 */
 
 int synth_port_sd_mount(void) { return -1; }
@@ -96,5 +170,7 @@ int synth_port_patch_load_file(const char *path) { (void)path; return -1; }
 int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
     (void)index; (void)p; return -1;
 }
+uint32_t synth_port_sd_selftest(void) { return 0u; }
+uint32_t synth_port_sd_exported(void) { return 0u; }
 
 #endif /* SYNTH_PORT_SD_ENABLE */
