@@ -68,6 +68,12 @@ struct Engine {
     bool         mono_mode = false;
     int8_t       chan_filter = -1;
 
+    /* NRPN（CC 99/98 选参数，CC 6/38 送 14 位值）：midi_ctl 的参数几乎全走这条路径 */
+    uint8_t      nrpn_msb = 0x7Fu;
+    uint8_t      nrpn_lsb = 0x7Fu;
+    bool         nrpn_active = false;
+    uint16_t     nrpn_value = 0u;
+
     MidiParser   parser;
     synth_stats_t stats{};
 
@@ -81,6 +87,12 @@ struct Engine {
     volatile int16_t      req_chan_patch[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                                 -1, -1, -1, -1, -1, -1, -1, -1};
     const synth_patch_t * volatile req_patch_ptr = nullptr;
+    /* 单通道的"整份音色内容"请求（SD 卡上的 /synth/NNN.syn）：与 req_patch_ptr 同套路，
+       只不过只覆盖一个通道 —— 多音色下每个通道可以各有各的卡上音色。 */
+    const synth_patch_t * volatile req_chan_ptr[16] = {nullptr, nullptr, nullptr, nullptr,
+                                                       nullptr, nullptr, nullptr, nullptr,
+                                                       nullptr, nullptr, nullptr, nullptr,
+                                                       nullptr, nullptr, nullptr, nullptr};
     volatile uint32_t     req_panic_flag = 0u;
     volatile uint32_t     req_all_off_flag = 0u;
     volatile float        req_master_vol = -1.0f;
@@ -277,16 +289,82 @@ void PushPatchToChannelVoices(Engine &e, uint8_t c) {
     }
 }
 
+/* ---- NRPN（CC 99/98 选参数 + CC 6/38 送 14 位值）----------------------------
+   上位机（D:\Tools\midi_ctl）的旋钮几乎全部走 NRPN，所以这里先接一组"常用音色参数"：
+   param = (MSB << 7) | LSB，下表用 MSB = 0、LSB = 0..32。表外的 NRPN 记进
+   stats.nrpn_unmapped，原号原值留在 stats.last_nrpn（status.ps1 会打印），等看清每个
+   旋钮实际发什么号，再按你的界面精确映射。14 位值按目标字段类型缩放。 */
+void ApplyNrpn(Engine &e, uint8_t ch, uint16_t param, uint16_t value) {
+    const uint8_t c = (uint8_t)(ch & 0x0Fu);
+    synth_patch_t &p = e.chan_patch[c];
+    const uint16_t v14 = (uint16_t)(value & 0x3FFFu);
+    const uint8_t  v8  = (uint8_t)(v14 >> 6);          /* 0..255 */
+    const int32_t  vs  = (int32_t)v14 - 8192;          /* -8192..8191（带符号字段用） */
+    const float    v01 = (float)v14 * (1.0f / 16383.0f);
+    switch (param) {
+        case 0:  p.cutoff        = v8; break;
+        case 1:  p.resonance     = v8; break;
+        case 2:  p.filter_env_amt = (int8_t)(v8 - 128); break;
+        case 3:  p.keytrack      = v8; break;
+        case 4:  p.lfo_rate      = v8; break;
+        case 5:  p.lfo_depth     = v8; break;
+        case 6:  p.amp_a = v8; break;
+        case 7:  p.amp_d = v8; break;
+        case 8:  p.amp_s = v8; break;
+        case 9:  p.amp_r = v8; break;
+        case 10: p.osc2_semi   = (int8_t)((vs * 24) / 8192); break;   /* ±24 半音 */
+        case 11: p.osc2_detune = (int8_t)(vs / 128); break;           /* ±64 音分 */
+        case 12: p.sub_level   = v8; break;
+        case 13: p.noise_level = v8; break;
+        case 14: p.glide       = v8; break;
+        case 15: p.fx_drive    = v8; break;
+        case 16: p.fx_chorus   = v8; break;
+        case 17: p.fx_delay    = v8; break;
+        case 18: p.fx_delay_fb = v8; break;
+        case 19: p.volume      = v8; break;
+        case 20: e.g.master_vol = v01; break;                         /* 总音量（全局） */
+        case 21: p.osc1_pw = v8; p.osc2_pw = v8; break;
+        case 22: p.filter_type = (uint8_t)(v14 / 2341u); break;        /* 0..6 */
+        case 23: p.flt_a = v8; break;
+        case 24: p.flt_d = v8; break;
+        case 25: p.flt_s = v8; break;
+        case 26: p.flt_r = v8; break;
+        case 27: p.osc1_level = v8; break;
+        case 28: p.osc2_level = v8; break;
+        case 29: p.osc1_model = (uint8_t)(v14 / 5461u); break;         /* 0..2 */
+        case 30: p.osc2_model = (uint8_t)(v14 / 5461u); break;
+        case 31: p.lfo_shape = (uint8_t)(v14 / 3277u); break;          /* 0..4 */
+        case 32: p.lfo_dest  = (uint8_t)(v14 / 5461u); break;          /* 0..2 */
+        default: e.stats.nrpn_unmapped++; return;
+    }
+    e.stats.nrpn_used++;
+    PushPatchToChannelVoices(e, c);
+}
+
+/* CC 6（MSB）/ CC 38（LSB）：把值拼成 14 位后交给映射表 */
+void NrpnDataEntry(Engine &e, uint8_t ch, uint8_t val, bool msb) {
+    if (!e.nrpn_active) { e.stats.unknown_cc++; return; }   /* 没有先选参数号：当普通 CC 丢掉 */
+    if (msb) e.nrpn_value = (uint16_t)((e.nrpn_value & 0x007Fu) | ((uint16_t)(val & 0x7Fu) << 7));
+    else     e.nrpn_value = (uint16_t)((e.nrpn_value & 0x3F80u) | (uint16_t)(val & 0x7Fu));
+    e.stats.last_nrpn = ((uint32_t)e.nrpn_msb << 24) | ((uint32_t)e.nrpn_lsb << 16) | (uint32_t)e.nrpn_value;
+    ApplyNrpn(e, ch, (uint16_t)(((uint16_t)e.nrpn_msb << 7) | e.nrpn_lsb), e.nrpn_value);
+}
+
 void ControlChange(Engine &e, uint8_t ch, uint8_t cc, uint8_t val) {
     const uint8_t c = (uint8_t)(ch & 0x0Fu);
     synth_patch_t &p = e.chan_patch[c];
     bool patch_changed = false;
     const float v01 = (float)val * (1.0f / 127.0f);
     switch (cc) {
+        case 0:   break;                                   /* Bank Select MSB：本机只有一个音库 */
         case 1:   e.g.lfo_depth_mod = v01; break;
         case 2:   e.g.cutoff_mod = v01 * 1.5f - 0.25f; break;
         case 5:   p.glide = val; patch_changed = true; break;
-        case 7:   e.g.master_vol = v01; break;
+        case 6:   NrpnDataEntry(e, c, val, true); break;
+        case 7:   p.volume = val; patch_changed = true; break;  /* GM 通道音量：改成每通道 */
+        case 11:  e.g.master_vol = v01; break;                  /* 表情：总音量（原来是 CC7） */
+        case 32:  break;                                   /* Bank Select LSB */
+        case 38:  NrpnDataEntry(e, c, val, false); break;
         case 64:
             e.sustain = (val >= 64);
             e.stats.sustain = e.sustain ? 1u : 0u;
@@ -300,6 +378,11 @@ void ControlChange(Engine &e, uint8_t ch, uint8_t cc, uint8_t val) {
         case 76:  p.lfo_rate = val; patch_changed = true; break;
         case 77:  p.lfo_depth = val; patch_changed = true; break;
         case 79:  p.volume = val; patch_changed = true; break;
+        case 91:  p.fx_delay = val; patch_changed = true; break;   /* 混响量 → 本机的延迟量 */
+        case 93:  p.fx_chorus = val; patch_changed = true; break;  /* 合唱量 */
+        case 98:  e.nrpn_lsb = (uint8_t)(val & 0x7Fu); e.nrpn_active = true; e.nrpn_value = 0u; break;
+        case 99:  e.nrpn_msb = (uint8_t)(val & 0x7Fu); e.nrpn_active = true; e.nrpn_value = 0u; break;
+        case 100: case 101: e.nrpn_active = false; break;          /* RPN 选择：不进 NRPN 映射表 */
         case 20:  e.arp.SetMode(val == 0 ? (uint8_t)Arp::kOff : (uint8_t)((val <= 5) ? val : 5)); break;
         case 21:  e.arp.SetRateHz(0.5f * powf(30.0f, v01)); break;
         case 22:  e.arp.SetGate(v01); break;
@@ -321,12 +404,17 @@ void HandleMessage(Engine &e, uint8_t status, uint8_t d1, uint8_t d2) {
         case 0x80u: NoteOffInternal(e, chan, d1); break;
         case 0xB0u: ControlChange(e, chan, d1, d2); break;
         case 0xC0u:
-            /* 标准 GM 行为：Program Change 只切"本通道"的音色；越界（>= 音色数）按设计忽略 */
+            /* 标准 GM 行为：Program Change 只切"本通道"的音色，音库里有就直接换（前 15 个是
+               内置音色）。音库里没有的号（>= bank_size）也要**记为请求**：端口层
+               （synth_port_lib_service / synth_port_patch_service）靠 patch_index 的变化去
+               QSPI 采样库或 SD 卡上找货；找到了才真正发声，找不到内容保持不变。 */
             if (ApplyPatchIndexToChannel(e, chan, d1)) {
                 memcpy(&e.patch, &e.chan_patch[chan], sizeof(e.patch));   /* 全局 FX/统计跟随最近一次切换 */
-                e.patch_index = d1;
-                e.stats.patch_index = d1;
+            } else {
+                e.chan_idx[chan & 0x0Fu] = d1;    /* 只有请求，没有内容 */
             }
+            e.patch_index = d1;
+            e.stats.patch_index = d1;
             break;
         case 0xE0u: e.g.bend = ((float)(((uint16_t)d2 << 7) | d1) - 8192.0f) * (1.0f / 8192.0f); break;
         default: break;
@@ -362,6 +450,13 @@ void RenderBlock(Engine &e, float *out, uint32_t frames) {
         memcpy(&e.patch, rpp, sizeof(e.patch));
         for (uint8_t c = 0; c < 16u; ++c) memcpy(&e.chan_patch[c], rpp, sizeof(e.chan_patch[c]));
         e.patch_index = 0xFFFFu;
+    }
+    for (uint8_t c = 0; c < 16u; ++c) {              /* synth_set_channel_patch_data() 的单通道请求 */
+        const synth_patch_t *rcp = e.req_chan_ptr[c];
+        if (rcp != nullptr) {
+            e.req_chan_ptr[c] = nullptr;
+            memcpy(&e.chan_patch[c], rcp, sizeof(e.chan_patch[c]));
+        }
     }
     const float rmv = e.req_master_vol;
     if (rmv >= 0.0f) { e.req_master_vol = -1.0f; e.g.master_vol = clampf(rmv, 0.0f, 1.0f); }
@@ -558,6 +653,14 @@ extern "C" int synth_set_channel_patch(uint8_t channel, uint16_t index) {
 extern "C" uint16_t synth_get_channel_patch(uint8_t channel) {
     if (channel > 15u || g_eng.bank_size == 0u) return 0xFFFFu;
     return g_eng.chan_idx[channel & 0x0Fu];
+}
+
+/* 只替换一个通道的音色"内容"（用于 SD 卡上的 /synth/NNN.syn）。PC 号（chan_idx）保持不变，
+   所以"通道 → 音色号"的映射与开机持久化不受影响；下一次该通道收到 PC 时又会回到内置表。 */
+extern "C" int synth_set_channel_patch_data(uint8_t channel, const synth_patch_t *patch) {
+    if (channel > 15u || patch == nullptr) return -1;
+    g_eng.req_chan_ptr[channel & 0x0Fu] = patch;   /* 音频线程在下一块开头拷贝走 */
+    return 0;
 }
 
 extern "C" void synth_note_on(uint8_t note, uint8_t velocity) {

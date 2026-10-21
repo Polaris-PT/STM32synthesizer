@@ -1,0 +1,99 @@
+{
+	// Cortex-Debug（扩展 marus25.cortex-debug，已装）配置。
+	// 三种用法：
+	//   ① 附加   —— 板子已经跑着（哪怕卡死了）：停下来看它卡在哪，不烧写、不复位
+	//   ② 调试   —— 构建 → 烧写 → 停在 main()，然后单步 / 看变量
+	//   ③ Debug  —— 同上但用 -O0 构建，单步最准（128KB flash 很紧张，不一定放得下）
+	// 说明：executable 必须和「板上真正跑的那份固件」同一次编译，否则符号对不上。
+	//       SVD 用的是 Keil STM32H7xx_DFP 里的 STM32H750.svd，用来在 XPERIPHERALS 里看寄存器。
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "① 附加到板子（不烧写不复位，看卡在哪）",
+			"type": "cortex-debug",
+			"request": "attach",
+			"cwd": "${workspaceFolder}",
+			"executable": "${workspaceFolder}/build/RelWithDebInfo/STM32synthesizer.elf",
+			"servertype": "openocd",
+			"serverpath": "C:/Tools/OpenOCD/bin/openocd.exe",
+			"searchDir": [
+				"C:/Tools/OpenOCD/share/openocd/scripts"
+			],
+			"configFiles": [
+				"C:/Tools/OpenOCD/share/openocd/scripts/interface/cmsis-dap.cfg",
+				"C:/Tools/OpenOCD/share/openocd/scripts/target/stm32h7x.cfg"
+			],
+			"openOCDLaunchCommands": [
+				"adapter speed 1800"
+			],
+			"device": "STM32H750VB",
+			"interface": "swd",
+			"armToolchainPath": "C:/Tools/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",
+			"svdFile": "C:/Users/Polaris/AppData/Local/Arm/Packs/Keil/STM32H7xx_DFP/4.0.0/CMSIS/SVD/STM32H750.svd",
+			"showDevDebugOutput": "none"
+		},
+		{
+			"name": "② 构建 → 烧写 → 调试（停在 main）",
+			"type": "cortex-debug",
+			"request": "launch",
+			"cwd": "${workspaceFolder}",
+			"executable": "${workspaceFolder}/build/RelWithDebInfo/STM32synthesizer.elf",
+			"servertype": "openocd",
+			"serverpath": "C:/Tools/OpenOCD/bin/openocd.exe",
+			"searchDir": [
+				"C:/Tools/OpenOCD/share/openocd/scripts"
+			],
+			"configFiles": [
+				"C:/Tools/OpenOCD/share/openocd/scripts/interface/cmsis-dap.cfg",
+				"C:/Tools/OpenOCD/share/openocd/scripts/target/stm32h7x.cfg"
+			],
+			"openOCDLaunchCommands": [
+				"adapter speed 1800"
+			],
+			"device": "STM32H750VB",
+			"interface": "swd",
+			"armToolchainPath": "C:/Tools/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",
+			"svdFile": "C:/Users/Polaris/AppData/Local/Arm/Packs/Keil/STM32H7xx_DFP/4.0.0/CMSIS/SVD/STM32H750.svd",
+			"preLaunchTask": "构建 (RelWithDebInfo)",
+			"runToEntryPoint": "main",
+			// 预先下这三个断点（比在 while(1) 里瞎转强）：
+			//   Error_Handler    —— 任何 MX_xxx_Init() 失败都会停这（fault bit7 = APP_FAULT_HAL）
+			//   HardFault_Handler —— HardFault 第一现场（它内部会调 NVIC_SystemReset()，
+			//                        而 NVIC_SystemReset 是 core_cm7.h 的内联函数、没有符号，
+			//                        所以只能断在 HardFault_Handler 上）
+			//   Default_Handler  —— 没写处理函数的异常/中断落在这里（漏配 NVIC 时能抓到）
+			"postLaunchCommands": [
+				"break Error_Handler",
+				"break HardFault_Handler",
+				"break Default_Handler"
+			],
+			"showDevDebugOutput": "none"
+		},
+		{
+			"name": "③ 构建(Debug -O0) → 烧写 → 调试",
+			"type": "cortex-debug",
+			"request": "launch",
+			"cwd": "${workspaceFolder}",
+			"executable": "${workspaceFolder}/build/Debug/STM32synthesizer.elf",
+			"servertype": "openocd",
+			"serverpath": "C:/Tools/OpenOCD/bin/openocd.exe",
+			"searchDir": [
+				"C:/Tools/OpenOCD/share/openocd/scripts"
+			],
+			"configFiles": [
+				"C:/Tools/OpenOCD/share/openocd/scripts/interface/cmsis-dap.cfg",
+				"C:/Tools/OpenOCD/share/openocd/scripts/target/stm32h7x.cfg"
+			],
+			"openOCDLaunchCommands": [
+				"adapter speed 1800"
+			],
+			"device": "STM32H750VB",
+			"interface": "swd",
+			"armToolchainPath": "C:/Tools/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",
+			"svdFile": "C:/Users/Polaris/AppData/Local/Arm/Packs/Keil/STM32H7xx_DFP/4.0.0/CMSIS/SVD/STM32H750.svd",
+			"preLaunchTask": "构建 (Debug)",
+			"runToEntryPoint": "main",
+			"showDevDebugOutput": "none"
+		}
+	]
+}

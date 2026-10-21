@@ -9,6 +9,9 @@
 
 #include "../src/app/patch_text.h"
 #include "ff.h"
+#include "stm32h7xx_hal.h"   /* HAL_GetTick()：状态持久化的静默窗口计时 */
+#include "module.h"          /* RAM overlay 模块头布局（/synth/ui.bin 导入时用） */
+#include "qspi_flash.h"      /* 模块镜像写进 QSPI 的原语 */
 #include <string.h>
 #include <stdio.h>
 
@@ -57,25 +60,63 @@ int synth_port_patch_load_file(const char *path) {
     return 0;
 }
 
-/* 主循环轮询：Program Change 请求的音色若在 SD 上有对应文件则加载 */
+/* 每通道一份音色缓冲：不能 16 个通道共用一个 —— synth_set_channel_patch_data() 只是把
+   指针挂给引擎，音频线程下一块才拷贝，同一轮里挂多个指针就会全部指向最后那份内容。 */
+static synth_patch_t g_chan_patch_buf[16];
+static int16_t       g_chan_seen[16];    /* 上一次看到的通道音色号（-1 = 还没处理过） */
+static uint8_t       g_chan_force[16];   /* 1 = 本次必须重新从卡上取（开机恢复映射之后） */
+
+/* 从卡上给某个通道取 /synth/NNN.syn 覆盖该通道的音色内容（没有该文件返回负值） */
+static int LoadChannelPatchFromCard(uint8_t c, uint16_t idx) {
+    char path[64];
+    snprintf(path, sizeof(path), SYNTH_PORT_PATCH_DIR "/%03u.syn", (unsigned)idx);
+    if (f_open(&g_file, path, FA_READ) != FR_OK) return -1;
+
+    UINT got = 0u;
+    const FRESULT fr = f_read(&g_file, g_text, sizeof(g_text) - 1u, &got);
+    f_close(&g_file);
+    if (fr != FR_OK || got == 0u) return -2;
+
+    g_text[got < sizeof(g_text) ? got : sizeof(g_text) - 1u] = '\0';
+    patch_set_defaults(&g_chan_patch_buf[c]);
+    if (patch_from_text(g_text, &g_chan_patch_buf[c]) <= 0) return -3;   /* 返回字段个数 */
+    return synth_set_channel_patch_data(c, &g_chan_patch_buf[c]);
+}
+
+/* 主循环轮询：① 主音色号变了 → 先看 QSPI 采样库，再看卡上 /synth/NNN.ins|.syn
+                 ② 任一通道音色号变了 → 从卡上取该通道的 .syn（没有就保持内置音色） */
 void synth_port_patch_service(void) {
     const int16_t cur = (int16_t)synth_get_patch_index();
-    if (cur == g_last_request) return;
-    g_last_request = cur;
-    if (!g_mounted || cur < 0) return;
+    if (!g_mounted) { g_last_request = cur; return; }
 
-    char path[64];
-    /* 1) 采样乐器清单 */
-    snprintf(path, sizeof(path), SYNTH_PORT_PATCH_DIR "/%03d.ins", (int)cur);
-    if (synth_port_instrument_load(path) > 0) return;
-    /* 2) 其它音色文件（.syx / .syn）——没有就继续用内置音色 */
-    snprintf(path, sizeof(path), SYNTH_PORT_PATCH_DIR "/%03d.syn", (int)cur);
-    (void)synth_port_patch_load_file(path);
+    if (cur != g_last_request) {
+        g_last_request = cur;
+        if (cur >= 0) {
+            if (synth_port_lib_has_pc((uint8_t)cur)) {
+                /* QSPI 库优先：零拷贝、开机就在，比卡快得多。想用卡上的版本就把库里
+                   那个 PC 换成别的号（pack 时决定）。 */
+                (void)synth_port_lib_load_pc((uint8_t)cur, NULL);
+            } else {
+                char path[64];
+                snprintf(path, sizeof(path), SYNTH_PORT_PATCH_DIR "/%03d.ins", (int)cur);
+                if (synth_port_instrument_load(path) <= 0) {
+                    /* 没有采样乐器就试文本音色（.syn / DX7 .syx） */
+                    snprintf(path, sizeof(path), SYNTH_PORT_PATCH_DIR "/%03d.syn", (int)cur);
+                    (void)synth_port_patch_load_file(path);
+                }
+            }
+        }
+    }
 
-    /* 也支持按名字：/synth/<音色名>.syn */
-    synth_stats_t st;
-    synth_get_stats(&st);
-    (void)st;
+    for (uint8_t c = 0u; c < 16u; ++c) {
+        const uint16_t idx = synth_get_channel_patch(c);
+        const int16_t cur_ch = (idx == 0xFFFFu) ? (int16_t)-1 : (int16_t)idx;
+        const uint8_t force = g_chan_force[c];
+        if (cur_ch == g_chan_seen[c] && !force) continue;
+        g_chan_seen[c] = cur_ch;
+        g_chan_force[c] = 0u;
+        if (cur_ch >= 0) (void)LoadChannelPatchFromCard(c, (uint16_t)cur_ch);
+    }
 }
 
 int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
@@ -162,9 +203,297 @@ uint32_t synth_port_sd_selftest(void) {
 
 uint32_t synth_port_sd_exported(void) { return g_sd_exported; }
 
+/* ---- 写回 / 覆盖自检：证明"卡上的内容才是权威" ---------------------------------------
+   前面的自检只能证明"卡上的文件读得出来、解析得动"，但证明不了**覆盖生效**
+   （卡上内容与内置表相同的话，解析成功也不能区分数据来自哪边）。
+   做法：取内置音色 0（Init Saw，cutoff = 150）的副本、只把 cutoff 改成 40，
+         覆盖写到 /synth/000.syn → 读回解析，看 cutoff 是不是 40（是 ⇒ 数据来自卡）
+         → 再把内置原件写回去（恢复卡上模板）→ 再读回确认 cutoff 回到内置值。
+   用 000 号：它就是开机默认音色，测试完会恢复成原件，不会在卡上留下奇怪的音色。
+   返回位图：bit0 覆盖写成功 / bit1 读回解析出的 cutoff = 测试值 / bit2 恢复原件成功 /
+             bit3 恢复后读回解析出的 cutoff = 内置值。 */
+#define SD_WTEST_CUTOFF 40u
+
+static int SdReadPatchCutoff(uint16_t *out_cutoff) {
+    UINT got = 0u;
+    synth_patch_t tmp;
+
+    if (f_open(&g_file, SYNTH_PORT_PATCH_DIR "/000.syn", FA_READ) != FR_OK) return -1;
+    const FRESULT fr = f_read(&g_file, g_text, sizeof(g_text) - 1u, &got);
+    f_close(&g_file);
+    if (fr != FR_OK || got == 0u) return -2;
+
+    g_text[got < sizeof(g_text) ? got : sizeof(g_text) - 1u] = '\0';
+    patch_set_defaults(&tmp);
+    if (patch_from_text(g_text, &tmp) <= 0) return -3;   /* 返回字段个数，不是 0 */
+    if (out_cutoff != 0) *out_cutoff = (uint16_t)tmp.cutoff;
+    return 0;
+}
+
+uint32_t synth_port_sd_write_test(void) {
+    uint32_t bits = 0u;
+    uint16_t seen = 0u;
+
+    if (!g_mounted) return bits;
+
+    /* 1) 覆盖写：内置音色 0 的副本，只改 cutoff */
+    synth_patch_t mod = synth_factory_bank[0];
+    mod.cutoff = (uint8_t)SD_WTEST_CUTOFF;
+    if (synth_port_patch_save_file(0u, &mod) == 0) bits |= 0x01u;
+
+    /* 2) 读回解析：cutoff 应该是测试值（说明卡上内容真的生效了） */
+    if (SdReadPatchCutoff(&seen) == 0 && seen == (uint16_t)SD_WTEST_CUTOFF) bits |= 0x02u;
+
+    /* 3) 把内置原件写回去，恢复卡上模板 */
+    if (synth_port_patch_save_file(0u, &synth_factory_bank[0]) == 0) bits |= 0x04u;
+
+    /* 4) 再读回确认已恢复 */
+    if (SdReadPatchCutoff(&seen) == 0 && seen == (uint16_t)synth_factory_bank[0].cutoff) bits |= 0x08u;
+
+    return bits;
+}
+
+/* ---- 开机状态持久化（/synth/state.cfg）------------------------------------------
+   存的是"16 个通道分别用哪个音色号"（就是 Program Change 号），不存音色内容本身 ——
+   音色内容在 /synth/NNN.syn 里。开机流程：恢复索引 → patch_service 发现索引变化
+   → 从卡加载对应文件，与手动切音色完全同一条路径，所以生效语义一致。
+   文本格式（一行一个通道，方便人肉改）：
+       synth-state 1
+       ch0=5
+       ch15=0
+   写盘时机：主循环里轮询（synth_port_state_service），索引变化后静默 2 s 才落盘，
+   避免连续切音色时反复擦写。两个结果给 status.ps1 看：state_load / state_saves。 */
+#define SYNTH_STATE_FILE      SYNTH_PORT_PATCH_DIR "/state.cfg"
+#define SYNTH_STATE_QUIET_MS  2000u
+
+static int16_t  g_state_seen[16];       /* 上一次看到的通道音色号（-1 = 尚未建立基线） */
+static uint32_t g_state_dirty_ms = 0u;  /* 0 = 没有待写；否则 = 最近一次变化的时间戳 */
+static int      g_state_load = -1;      /* -1 = 没文件/读失败；>= 0 = 恢复的通道数 */
+static uint32_t g_state_saves = 0u;
+
+static void StateSnapshotChannels(void) {
+    for (int c = 0; c < 16; ++c) {
+        const uint16_t idx = synth_get_channel_patch((uint8_t)c);
+        g_state_seen[c] = (idx == 0xFFFFu) ? (int16_t)-1 : (int16_t)idx;
+    }
+}
+
+/* 开机时把 16 个通道在卡上的 .syn 内容各读一次。调用点在 main() 第 8 步（起音频之前），
+   所以读卡不会饿着预渲染环；同时把 g_chan_seen 设成当前音色号，主循环里的 patch_service
+   就不会再为这些通道重复读一遍卡。读不到文件就保持内置音色。 */
+static void LoadAllChannelPatchesFromCard(void) {
+    for (uint8_t c = 0u; c < 16u; ++c) {
+        const uint16_t idx = synth_get_channel_patch(c);
+        const int16_t v = (idx == 0xFFFFu) ? (int16_t)-1 : (int16_t)idx;
+        g_chan_force[c] = 0u;
+        g_chan_seen[c] = v;
+        if (v >= 0) (void)LoadChannelPatchFromCard(c, (uint16_t)v);
+    }
+}
+
+/* 读 state.cfg 并把 16 个通道音色号排进引擎队列；返回恢复的通道数（-1 = 没有文件） */
+int synth_port_state_load(void) {
+    if (!g_mounted) return -1;
+    if (f_open(&g_file, SYNTH_STATE_FILE, FA_READ) != FR_OK) {
+        StateSnapshotChannels(); LoadAllChannelPatchesFromCard(); return -1;
+    }
+
+    UINT got = 0u;
+    const FRESULT fr = f_read(&g_file, g_text, sizeof(g_text) - 1u, &got);
+    f_close(&g_file);
+    if (fr != FR_OK || got == 0u) {
+        StateSnapshotChannels(); LoadAllChannelPatchesFromCard(); return -1;
+    }
+    g_text[got < sizeof(g_text) ? got : sizeof(g_text) - 1u] = '\0';
+
+    /* 只认 "chNN=<数字>"，其它行一律跳过（以后加字段不会破坏老文件） */
+    int restored = 0;
+    const char *p = g_text;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+        if (p[0] == 'c' && p[1] == 'h') {
+            const char *q = p + 2;
+            int ch = 0, val = 0;
+            while (*q >= '0' && *q <= '9') { ch = ch * 10 + (*q - '0'); ++q; }
+            if (*q == '=') {
+                ++q;
+                while (*q >= '0' && *q <= '9') { val = val * 10 + (*q - '0'); ++q; }
+                if (ch >= 0 && ch < 16 && val >= 0 && val < (int)synth_factory_bank_size) {
+                    synth_set_channel_patch((uint8_t)ch, (uint16_t)val);
+                    ++restored;
+                }
+            }
+            p = q;
+        }
+        while (*p != '\0' && *p != '\n') ++p;
+    }
+    g_state_load = restored;
+    StateSnapshotChannels();
+    /* 卡上内容一次性读好（g_chan_seen 同步更新）⇒ 主循环不会再重复读卡；没写进 state.cfg
+       的通道也在这里读它的 .syn，保持"卡上文件优先于内置音色"的语义。 */
+    LoadAllChannelPatchesFromCard();
+    return restored;
+}
+
+/* 立刻把当前 16 个通道音色号写进 state.cfg */
+int synth_port_state_save(void) {
+    if (!g_mounted) return -1;
+    int n = snprintf(g_text, sizeof(g_text), "synth-state 1\n");
+    if (n < 0) return -2;
+    for (int c = 0; c < 16 && n > 0 && (size_t)n < sizeof(g_text); ++c) {
+        const uint16_t idx = synth_get_channel_patch((uint8_t)c);
+        const int m = snprintf(g_text + n, sizeof(g_text) - (size_t)n, "ch%d=%u\n", c,
+                               (unsigned)((idx == 0xFFFFu) ? 0u : idx));
+        if (m < 0) break;
+        n += m;
+    }
+    if (f_open(&g_file, SYNTH_STATE_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return -3;
+    UINT wrote = 0u;
+    const FRESULT fr = f_write(&g_file, g_text, (UINT)n, &wrote);
+    f_close(&g_file);
+    if (fr != FR_OK || wrote != (UINT)n) return -4;
+    ++g_state_saves;
+    return 0;
+}
+
+/* 主循环轮询：索引变了就记脏，静默 2 s 后落盘 */
+void synth_port_state_service(void) {
+    if (!g_mounted) return;
+    if (g_state_seen[0] < 0 && g_state_seen[15] < 0) { StateSnapshotChannels(); return; }
+
+    int changed = 0;
+    for (int c = 0; c < 16; ++c) {
+        const uint16_t idx = synth_get_channel_patch((uint8_t)c);
+        const int16_t cur = (idx == 0xFFFFu) ? (int16_t)-1 : (int16_t)idx;
+        if (cur != g_state_seen[c]) { g_state_seen[c] = cur; changed = 1; }
+    }
+    const uint32_t now = HAL_GetTick();
+    if (changed) { g_state_dirty_ms = (now != 0u) ? now : 1u; return; }
+    if (g_state_dirty_ms != 0u && (uint32_t)(now - g_state_dirty_ms) >= SYNTH_STATE_QUIET_MS) {
+        if (synth_port_state_save() == 0) g_state_dirty_ms = 0u;
+        else g_state_dirty_ms = now;        /* 写失败：下个静默窗口再试 */
+    }
+}
+
+int      synth_port_state_load_result(void) { return g_state_load; }
+uint32_t synth_port_state_save_count(void)  { return g_state_saves; }
+
+int synth_port_sd_is_mounted(void) { return g_mounted ? 1 : 0; }
+
+/* ── RAM overlay 模块：把卡上的 /synth/ui.bin 写进 QSPI（0x7F0000 起）────────────
+   文件布局 = synth_module_hdr_t（36 B）+ 裸镜像。
+
+   顺序讲究（2026-10-20 踩过两个坑）：
+     1) 头部必须**最后**写：中途失败/掉电时头部无效 → 下次开机自动重导；
+     2) 镜像从 offset+36 开始，**不与 256 B 页边界对齐** ⇒ 必须按页边界切块，
+        否则 page_program() 会拒收（曾经镜像写不进去、头部却写成功 → 开机 CRC -3）；
+     3) 头部一致不等于镜像完整：还要对映射地址算一次 CRC 才算"已是最新"。
+   返回：0 = 已是最新 / 1 = 已导入 / -1 = 没挂载或没文件 / -2 = 头非法 / -3 = 擦写或校验失败 */
+#define SYNTH_MODULE_FILE "0:/synth/ui.bin"
+
+/* 板上镜像的数据 CRC：直接对映射地址算，与 module.c 校验的是同一块内存 */
+static uint32_t module_image_crc(uint32_t image_bytes)
+{
+    if (synth_port_qspi_ensure_mmap() != 0) return 0u;
+    const void *p = (const void *)(uintptr_t)(SYNTH_QSPI_MAP_BASE + SYNTH_QSPI_MODULE_OFFSET +
+                                             (uint32_t)sizeof(synth_module_hdr_t));
+    return synth_module_crc32(p, image_bytes);
+}
+
+int synth_port_module_import_from_card(void)
+{
+    if (!g_mounted) return -1;
+
+    FIL f;
+    if (f_open(&f, SYNTH_MODULE_FILE, FA_READ) != FR_OK) return -1;
+
+    synth_module_hdr_t h;
+    UINT got = 0;
+    if (f_read(&f, &h, sizeof(h), &got) != FR_OK || got != sizeof(h)) {
+        f_close(&f);
+        return -2;
+    }
+    if (h.magic != SYNTH_MODULE_MAGIC || h.version != SYNTH_MODULE_VERSION ||
+        h.abi != SYNTH_MODULE_ABI || h.hdr_bytes != (uint16_t)sizeof(synth_module_hdr_t) ||
+        h.image_bytes == 0u || (h.image_bytes & 3u) != 0u ||
+        (uint32_t)h.hdr_bytes + h.image_bytes > SYNTH_QSPI_MODULE_MAX) {
+        f_close(&f);
+        return -2;
+    }
+
+    /* 板上已经是最新？头部一致 **且** 镜像 CRC 对得上，才跳过 */
+    synth_module_hdr_t cur = {0};
+    if (synth_port_qspi_read(SYNTH_QSPI_MODULE_OFFSET, &cur, (uint32_t)sizeof(cur)) == 0 &&
+        cur.magic == SYNTH_MODULE_MAGIC && cur.build_id == h.build_id &&
+        cur.crc32 == h.crc32 && cur.image_bytes == h.image_bytes &&
+        module_image_crc(cur.image_bytes) == h.crc32) {
+        f_close(&f);
+        return 0;
+    }
+    /* 板上这份是用 USB 上传的（头部打了 USB 标记）→ 卡上那份是旧的，不要覆盖：
+       原厂/首次安装走卡，之后的迭代走 tools\\upload_module.py。
+       ⚠ 标记位置：upload_module.py 打的是头部的 `reserved[1]`（偏移 32），早期代码
+       查的是 `reserved[0]`（偏移 28）→ 结果每次上电都被卡上的旧 ui.bin 顶回去。
+       两个都认，避免以后再错位。 */
+    if (cur.magic == SYNTH_MODULE_MAGIC &&
+        (cur.reserved[0] == SYNTH_MODULE_USB_FLAG || cur.reserved[1] == SYNTH_MODULE_USB_FLAG)) {
+        f_close(&f);
+        return 0;
+    }
+
+    const uint32_t total   = (uint32_t)h.hdr_bytes + h.image_bytes;
+    const uint32_t sectors = (total + SYNTH_QSPI_SECTOR_BYTES - 1u) / SYNTH_QSPI_SECTOR_BYTES;
+    for (uint32_t i = 0; i < sectors; ++i) {
+        if (synth_port_qspi_erase_sector(SYNTH_QSPI_MODULE_OFFSET + i * SYNTH_QSPI_SECTOR_BYTES) < 0) {
+            f_close(&f);
+            (void)synth_port_qspi_mmap_reenter();
+            return -3;
+        }
+    }
+
+    /* 镜像：按页边界切块（起始地址 = offset + 36，不对齐页） */
+    static uint8_t s_page[SYNTH_QSPI_PAGE_BYTES];
+    uint32_t off  = SYNTH_QSPI_MODULE_OFFSET + (uint32_t)sizeof(h);
+    uint32_t left = h.image_bytes;
+    while (left > 0u) {
+        uint32_t chunk = SYNTH_QSPI_PAGE_BYTES - (off % SYNTH_QSPI_PAGE_BYTES);
+        if (chunk > left) chunk = left;
+        if (f_read(&f, s_page, (UINT)chunk, &got) != FR_OK || got != chunk ||
+            synth_port_qspi_write_enable() < 0 || synth_port_qspi_page_program(off, s_page, chunk) < 0) {
+            f_close(&f);
+            (void)synth_port_qspi_mmap_reenter();
+            return -3;
+        }
+        off  += chunk;
+        left -= chunk;
+    }
+
+    /* 头部最后写 */
+    if (synth_port_qspi_write_enable() < 0 ||
+        synth_port_qspi_page_program(SYNTH_QSPI_MODULE_OFFSET, &h, (uint32_t)sizeof(h)) < 0) {
+        f_close(&f);
+        (void)synth_port_qspi_mmap_reenter();
+        return -3;
+    }
+    f_close(&f);
+
+    synth_port_qspi_cache_invalidate();
+    (void)synth_port_qspi_mmap_reenter();      /* 回到映射模式（采样库/模块都靠它） */
+
+    /* 回读校验：头部 + 镜像 CRC 都对才算导入成功 */
+    if (synth_port_qspi_read(SYNTH_QSPI_MODULE_OFFSET, &cur, (uint32_t)sizeof(cur)) != 0 ||
+        cur.magic != SYNTH_MODULE_MAGIC || cur.build_id != h.build_id ||
+        cur.crc32 != h.crc32 || module_image_crc(cur.image_bytes) != h.crc32) {
+        return -3;
+    }
+    return 1;
+}
+
 #else /* !SYNTH_PORT_SD_ENABLE —— 未启用 FatFs：全部退化为“无卡”行为 */
 
 int synth_port_sd_mount(void) { return -1; }
+int synth_port_sd_is_mounted(void) { return 0; }
+int synth_port_module_import_from_card(void) { return 0; }
 void synth_port_patch_service(void) { }
 int synth_port_patch_load_file(const char *path) { (void)path; return -1; }
 int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
@@ -172,5 +501,11 @@ int synth_port_patch_save_file(uint16_t index, const synth_patch_t *p) {
 }
 uint32_t synth_port_sd_selftest(void) { return 0u; }
 uint32_t synth_port_sd_exported(void) { return 0u; }
+uint32_t synth_port_sd_write_test(void) { return 0u; }
+int      synth_port_state_load(void) { return -1; }
+int      synth_port_state_save(void) { return -1; }
+void     synth_port_state_service(void) { }
+int      synth_port_state_load_result(void) { return -1; }
+uint32_t synth_port_state_save_count(void) { return 0u; }
 
 #endif /* SYNTH_PORT_SD_ENABLE */

@@ -464,6 +464,134 @@ if ($words -ge 41) {
         $seText = if ($seBits.Count) { $seBits -join ' | ' } else { '无' }
         Write-Host ("  sd_err            0x{0:X}   (hsd1.ErrorCode: {1})" -f $se, $seText)
     }
+    if ($words -ge 46) {
+        $wt = [uint32]$v[43]
+        $wtBits = @()
+        if ($wt -band 0x01) { $wtBits += '覆盖写成功' }
+        if ($wt -band 0x02) { $wtBits += '读回是测试值(卡上内容生效)' }
+        if ($wt -band 0x04) { $wtBits += '恢复原件成功' }
+        if ($wt -band 0x08) { $wtBits += '恢复后读回=内置值' }
+        $wtText = if ($wt -eq 2147483648) { '未运行（该自检 2026-10-19 已通过，默认关闭：SYNTH_PORT_SD_WRITE_TEST=0）' }
+                  elseif ($wtBits.Count) { $wtBits -join ' / ' }
+                  else { '全部失败' }
+        Write-Host ''
+        Write-Host '覆盖自检（写改过的 000.syn → 读回确认 → 恢复原件；开启时期望 0x0F）' -ForegroundColor White
+        Write-Host ("  sd_wtest          0x{0:X2}   {1}" -f $wt, $wtText)
+
+        $qw = To-I32 $v[44]
+        $qr = [uint32]$v[45]
+        $qwText = if ($qw -eq 0) { '通过：擦除 + 页编程 + 内存映射读回一致' }
+                  elseif ($qw -eq 0x7FFFFFFF) { '未运行（该自检 2026-10-19 已通过，默认关闭：SYNTH_PORT_QSPI_WRITE_TEST=0）' }
+                  else { "失败在第 $([math]::Abs($qw)) 步（-1/-4 写使能、-2 擦除、-3/-7 WIP 超时、-5/-6 页编程、-8 回映射、-9 读回不一致）" }
+        Write-Host ''
+        Write-Host 'QSPI 数据通路自检（QSPI 最后一个 4 KB 扇区 0x7FF000 的写-读回；开启时期望 0 与 0x514E5953）' -ForegroundColor White
+        Write-Host ("  qspi_wtest        {0}   {1}" -f $qw, $qwText)
+        Write-Host ("  qspi_wtest_rd     0x{0:X8}   (通过时 = 0x514E5953 = 'SYNQ' 小端)" -f $qr)
+    }
+}
+
+# ---- 第二档：MIDI 控制面（NRPN）+ 开机持久化（索引 46..50）----
+if ($words -ge 51) {
+    $nrpnUsed = [uint32]$v[46]
+    $nrpnUn   = [uint32]$v[47]
+    $lastNrpn = [uint32]$v[48]
+    $stLoad   = To-I32 $v[49]
+    $stSaves  = [uint32]$v[50]
+
+    $lastText = if ($lastNrpn -eq 0) { '（还没收到 NRPN）' }
+                else {
+                    $nmsb = ($lastNrpn -shr 24) -band 0x7F
+                    $nlsb = ($lastNrpn -shr 16) -band 0x7F
+                    $nval = $lastNrpn -band 0x3FFF
+                    "MSB $nmsb / LSB $nlsb（参数号 $(($nmsb -shl 7) -bor $nlsb)）= $nval"
+                }
+    $loadText = if ($stLoad -lt 0) { '没有 /synth/state.cfg（首次开机或卡上没这文件）' }
+                else { "已恢复 $stLoad 个通道的音色号" }
+
+    Write-Host ''
+    Write-Host 'MIDI 控制面（NRPN = CC99/98 选参数 + CC6/38 送 14 位值；映射表在 engine.cpp 的 ApplyNrpn）' -ForegroundColor White
+    Write-Host ("  nrpn_used         {0}   命中映射表" -f $nrpnUsed)
+    Write-Host ("  nrpn_unmapped     {0}   没进映射表（>0 = 上位机在发我们还不认识的号）" -f $nrpnUn)
+    Write-Host ("  last_nrpn         {0}" -f $lastText)
+
+    Write-Host ''
+    Write-Host '开机持久化（/synth/state.cfg 记住 16 个通道各用哪个音色号）' -ForegroundColor White
+    Write-Host ("  state_load        {0}" -f $loadText)
+    Write-Host ("  state_saves       {0}   上电以来写回次数" -f $stSaves)
+}
+
+# ---- 第三档：QSPI 采样库（索引 51..53）----
+if ($words -ge 54) {
+    $libCount  = [uint32]$v[51]
+    $libSerial = [uint32]$v[52]
+    $libImport = To-I32 $v[53]
+
+    $impText = switch ($libImport) {
+        0       { '0    已是最新（serial 相同，没重写）或导入成功' }
+        -1      { '-1   SD 卡上没有 /synth/samples.bin' }
+        -2      { '-2   库头非法（magic/version/长度不对）' }
+        -3      { '-3   擦除失败' }
+        -4      { '-4   写入失败' }
+        -5      { '-5   写后校验失败' }
+        default { "$libImport" }
+    }
+    $libText = if ($libCount -eq 0) { '（QSPI 里还没有有效库）' }
+               else { "$libCount 件乐器，serial = 0x{0:X8}" -f $libSerial }
+
+    Write-Host ''
+    Write-Host 'QSPI 采样库（零拷贝播放；格式 docs/sample-library.md，打包 tools/pack_samples.py）' -ForegroundColor White
+    Write-Host ("  lib_count         {0}" -f $libText)
+    Write-Host ("  lib_import        {0}" -f $impText)
+    Write-Host  '                    发 PC = 库里某件乐器的号即可试听（库优先于卡上 .syn/.ins）'
+}
+
+# ---- RAM overlay 模块（索引 54..59）：TFT UI 等"可选功能"，不占内部 flash ----
+if ($words -ge 60) {
+    $modImport = To-I32 $v[54]
+    $modState  = To-I32 $v[55]
+    $modCrc    = [uint32]$v[56]
+    $modTicks  = [uint32]$v[57]
+    $modProbe0 = [uint32]$v[58]
+    $modProbe1 = [uint32]$v[59]
+
+    $stateText = switch ($modState) {
+        0  { '0    已加载（模块在跑）' }
+        -1 { '-1   QSPI 里没有模块（魔数不对 → 还没导入 /synth/ui.bin）' }
+        -2 { '-2   版本/ABI 不匹配（模块与固件不是同一次构建 → 重新打包 ui.bin）' }
+        -3 { '-3   CRC 校验失败（镜像损坏）' }
+        -4 { '-4   长度/入口偏移非法' }
+        -5 { '-5   entry 返回 NULL（模块自己拒绝初始化）' }
+        -6 { '-6   没走到这一步（固件在此之前就崩了）' }
+        -7 { '-7   QSPI 进不了内存映射模式（硬件/时钟问题）' }
+        default { "$modState" }
+    }
+    $impText2 = switch ($modImport) {
+        0  { '0    已是最新（build_id 相同，没重写）' }
+        1  { '1    已从 SD 导入 QSPI' }
+        -1 { '-1   SD 卡上没有 /synth/ui.bin' }
+        -2 { '-2   模块头非法' }
+        -3 { '-3   擦写失败' }
+        default { "$modImport" }
+    }
+
+    Write-Host ''
+    Write-Host 'RAM overlay 模块（SYNTH_MODULE_RAM_BASE = 0x24070000，QSPI 0x7F0000；tools\make_module.py 打包）' -ForegroundColor White
+    Write-Host ("  module_import     {0}" -f $impText2)
+    Write-Host ("  module_state      {0}" -f $stateText)
+    Write-Host ("  module_crc        0x{0:X8}" -f $modCrc)
+    Write-Host ("  module_ticks      {0}   （不涨 = 模块自己的 tick 卡住了；宿主每 10 ms 调一次）" -f $modTicks)
+    Write-Host ("  module_probe      0x{0:X8} 0x{1:X8}   （模块自己定义；最小测试模块 = tick 数 / 按键事件）" -f $modProbe0, $modProbe1)
+    if ($words -ge 61) {
+        $up = [uint32]$v[60]
+        $upState = $up -band 0xFF
+        $upErr   = [int]((($up -shr 8) -band 0xFF))
+        if ($upErr -gt 127) { $upErr = $upErr - 256 }
+        $upRes   = [int]((($up -shr 16) -band 0xFF))
+        if ($upRes -gt 127) { $upRes = $upRes - 256 }
+        $upNames = @{0='idle';1='等 0x7D';2='等命令';3='收长度';4='收偏移';5='收数据';6='跳过外来 SysEx'}
+        Write-Host ("  up_state          {0}（{1}）  err={2}  result={3}   （result: 0 已重新加载 / -2 头非法 / -3 CRC / -7 映射失败；一直 idle = 主机没发过）" -f `
+            $upState, $upNames[[int]$upState], $upErr, $upRes)
+    }
 }
 
 # ---- HardFault 现场（g_fault，由 Core/Src/main.c 的 App_HardFaultRecord() 写入）----

@@ -39,6 +39,9 @@ typedef struct {
     uint32_t patch_index;
     uint8_t  sustain;
     uint8_t  mono_mode;
+    uint32_t nrpn_used;          /* 收到并命中映射表的 NRPN 数 */
+    uint32_t nrpn_unmapped;      /* 收到但没进映射表的 NRPN 数（等看清控制器发什么号再补） */
+    uint32_t last_nrpn;          /* 最近一条 NRPN：MSB<<24 | LSB<<16 | 14 位值；0 = 还没收到 */
 } synth_stats_t;
 
 int      synth_init(const synth_config_t *cfg);
@@ -70,6 +73,8 @@ uint16_t synth_get_patch_index(void);
    注意：全局效果链（合唱/延迟/过载）跟随"最后一次切换到的音色"。 */
 int      synth_set_channel_patch(uint8_t channel, uint16_t index);
 uint16_t synth_get_channel_patch(uint8_t channel);          /* 0xFFFF = 未知/越界 */
+/* 只替换一个通道的音色内容（SD 上的 .syn）；PC 号不变，所以"通道 → 音色号"映射与持久化不受影响 */
+int      synth_set_channel_patch_data(uint8_t channel, const synth_patch_t *patch);
 void     synth_note_on(uint8_t note, uint8_t velocity);
 void     synth_note_off(uint8_t note);
 void     synth_set_channel_filter(int8_t channel);/* -1 = 全部通道（默认） */

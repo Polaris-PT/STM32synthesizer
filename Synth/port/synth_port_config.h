@@ -71,4 +71,29 @@ extern SAI_HandleTypeDef hsai_BlockB3;
 #define SYNTH_PORT_FAULT_RESET  0
 #endif
 
+/* --- QSPI 采样库自检（第三档）---
+   1 = 开机时如果 QSPI 里没有有效库，就在**内存里造一个**小库（1 件乐器、挂 PC 120、
+       2048 帧循环正弦）走同一条导入路径写进 QSPI，然后重新枚举/挂载。
+   用途：手边还没有 PC 打包出来的 samples.bin 时，验证「擦除 → 页编程 → 目录 → 零拷贝播放」
+   整条链路；发 PC 120 就能听到 93.75 Hz 的正弦。
+   ⚠ 会覆盖 QSPI 上的真库（真库导入后请把它关掉）。默认 0。 */
+#ifndef SYNTH_PORT_LIB_SELFTEST_ON_BOOT
+#define SYNTH_PORT_LIB_SELFTEST_ON_BOOT 0
+#endif
+
+/* --- 一次性验证自检（2026-10-19 都已上板通过，所以默认关）---
+   SYNTH_PORT_SD_WRITE_TEST   1 = 开机把 /synth/000.syn 用"改过的副本"覆盖写 → 读回确认卡上内容
+                              生效 → 再写回内置原件（会真的写卡，约 200 ms）。要通过它确认
+                              "卡上音色覆盖内置音色"时打开，看 g_app_status.sd_wtest == 0x0F。
+   SYNTH_PORT_QSPI_WRITE_TEST 1 = 开机擦 QSPI 最后一个 4 KB 扇区（0x7FF000）→ 写图案 →
+                              回内存映射读回比对（约 60 ms）。看 g_app_status.qspi_wtest == 0
+                              且 qspi_wtest_rd == 0x514E5953。
+   两个都只在验证期开；关掉能省 ~1.2 KB flash 和启动时间，也不折腾卡/闪存。 */
+#ifndef SYNTH_PORT_SD_WRITE_TEST
+#define SYNTH_PORT_SD_WRITE_TEST   0
+#endif
+#ifndef SYNTH_PORT_QSPI_WRITE_TEST
+#define SYNTH_PORT_QSPI_WRITE_TEST 0
+#endif
+
 #endif /* SYNTH_PORT_CONFIG_H */

@@ -57,6 +57,9 @@
 /* USER CODE BEGIN Includes */
 #include "synth_port_config.h"  /* SYNTH_PORT_* 开关（SD 使能、缓冲尺寸）——synth_port.h 不含它 */
 #include "synth_port.h"      /* Synth/port：应用层唯一入口（D-Cache/DWT/USB/SAI/SD） */
+#include "qspi_flash.h"      /* QSPI 底层原语：0x90000000 映射 / 擦 / 写 / 缓存失效 */
+#include "module.h"          /* RAM overlay 模块：加载/CRC/回调（TFT UI 走这条） */
+#include "module_upload.h"   /* USB SysEx 上传模块镜像（免拔卡迭代 UI 用） */
 #include "synth/synth.h"     /* 引擎公开 API（C ABI） */
 #include "debug_uart.h"      /* 调试串口 USART1（CubeMX 生成：PB14=TX/PB15=RX），开关见 synth_port_config.h */
 #include "usart.h"           /* MX_USART1_UART_Init() / huart1 */
@@ -136,6 +139,30 @@ typedef struct {
   uint32_t sd_dat3;      /* 历史字段，恒为 0：0 = DAT3 已交回 SDMMC 外设（4-bit 正常） */
   uint32_t sd_err;       /* 最后一次 SD 操作失败时 hsd1.ErrorCode（HAL_SD_ERROR_* 位）：
                             4 = CMD_RSP_TIMEOUT、8 = DATA_TIMEOUT、32 = RX_OVERRUN、1 = CMD_CRC_FAIL … */
+  uint32_t sd_wtest;     /* SD「卡上内容说了算」写回自检位图（Synth/port/patch_storage_sd.c）：
+                            bit0 覆盖写成功 / bit1 读回解析出的 cutoff = 测试值（说明卡上内容生效）/
+                            bit2 恢复原件成功 / bit3 恢复后读回解析出的 cutoff = 内置值 */
+  uint32_t qspi_wtest;   /* QSPI 数据通路自检：0 = 擦除 + 页编程 + 内存映射读回全部一致；
+                            负数 = 第几步失败（-1/-4 写使能、-2 擦除命令、-3/-7 WIP 超时、-5/-6 页编程、-8 回映射、-9 读回不一致） */
+  uint32_t qspi_wtest_rd;/* 从 0x90000000 + 0x7FF000 读回的头 4 字节（期望 0x514E5953 = "SYNQ" 小端） */
+  /* --- 第二档：MIDI 控制面 / 持久化 ------------------------------------- */
+  uint32_t nrpn_used;    /* 收到并命中映射表的 NRPN 数（Synth/src/core/engine.cpp 的 ApplyNrpn） */
+  uint32_t nrpn_unmapped;/* 收到但没进映射表的 NRPN 数（>0 说明上位机在发我们还不认识的号） */
+  uint32_t last_nrpn;    /* 最近一条 NRPN：MSB<<24 | LSB<<16 | 14 位值；0 = 还没收到 */
+  uint32_t state_load;   /* /synth/state.cfg 恢复结果：-1(0xFFFFFFFF) = 没文件，其余 = 恢复的通道数 */
+  uint32_t state_saves;  /* 上电以来把通道音色映射写回卡上的次数 */
+  /* --- 第三档：QSPI 采样库（docs/sample-library.md）--------------------- */
+  uint32_t lib_count;    /* QSPI 库里的乐器数（0 = 没有有效库） */
+  uint32_t lib_serial;   /* 库的 serial（PC 打包时按内容生成；用来判断要不要重新导入） */
+  uint32_t lib_import;   /* synth_port_lib_import_from_card() 返回值：0 = 已是最新/导入成功，
+                            -1 卡上没 samples.bin、-2 头非法、-3 擦除失败、-4 写入失败、-5 校验失败 */
+  /* --- RAM overlay 模块（TFT UI 等，见 Synth/port/module.h）：不占内部 flash ---------- */
+  uint32_t module_import; /* synth_port_module_import_from_card() 返回值：0 已最新 / 1 已导入 / <0 失败 */
+  int32_t  module_state;  /* synth_module_init() 返回：0 = 已加载，-1..-5 失败原因（见 module.h） */
+  uint32_t module_crc;    /* 已加载模块镜像的 CRC32（无模块时 0） */
+  uint32_t module_ticks;  /* 模块 tick 被调用的次数（不涨 = 模块自己卡住了） */
+  uint32_t module_probe[2]; /* 模块通过 api->set_probe() 回报的两个值（由模块自己定义） */
+  uint32_t up_state;      /* USB SysEx 上传状态机（调试用）：bit0-7 状态、bit8-15 首次错误、bit16-31 已写字节 */
 } app_status_t;
 
 /* ---- HardFault 现场记录 ------------------------------------------------------
@@ -173,6 +200,7 @@ typedef struct {
    模式字节(4线) → 4 空周期 → 数据(4线)。与 WeAct 官方 BSP 的 QSPI_EnableMemoryMappedMode()
    一致（它的"指令 1 线"分支也是 4，只有 QPI 模式才用 6）。读出的采样若整体错位/全 0xFF，改成 6 再试。 */
 #define APP_QSPI_DUMMY_CYCLES   4u
+#define APP_QSPI_MAP_BASE       0x90000000u   /* QSPI 内存映射窗口基址（与 sample_storage_qspi.c 一致） */
 
 /* PLL2 由 CubeMX 生成的代码负责（Core/Src/sai.c 的 HAL_SAI_MspInit：5 MHz × (108 + 1101/8192)
    / 22 = 24.57599987 MHz，误差 −0.13 Hz），这里不再重复配置。 */
@@ -222,10 +250,13 @@ static void App_CheckSaiClock(void);
 static void App_SaiGpioSpeed(void);
 static void App_ZeroDtcmBss(void);
 static int  App_QspiEnterMemoryMapped(void);
+static int  App_QspiWriteTest(void);
 static void App_Fault(uint32_t bit);
 static void App_RecordBoot(void);
 static void App_LedInit(void);
 static void App_LedTask(void);
+static void App_KeyInit(void);
+static void App_KeyTask(void);
 static uint32_t App_UsbKernelClockHz(void);
 static void App_SnapshotUsb(void);
 
@@ -306,6 +337,41 @@ static void App_LedTask(void)
     on = ((now % 2000u) < 100u) ? GPIO_PIN_SET : GPIO_PIN_RESET;
   }
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, on);
+}
+
+/* ── 用户键（PC13，**按下拉高**）+ 事件转发给 RAM overlay 模块 ────────────────────
+   该板 K1 接在 PC13，按下时把引脚拉高（不是拉低！）。所以配置必须用下拉：
+   若用上拉，引脚永远读 1，按键事件一个也收不到（症状：屏幕不翻页、module_probe[1] 恒 0）。
+   20 ms 消抖；只在"稳定状态变化"时回调模块（模块可以拿它做翻页/确认）。 */
+static void App_KeyInit(void)
+{
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  GPIO_InitTypeDef key;
+  key.Pin   = GPIO_PIN_13;
+  key.Mode  = GPIO_MODE_INPUT;
+  key.Pull  = GPIO_PULLDOWN;       /* 按下 = 高 ⇒ 平时靠下拉保持 0 */
+  key.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &key);
+}
+
+static void App_KeyTask(void)
+{
+  static uint32_t s_change_ms;
+  static uint8_t  s_raw = 0u;      /* 0 = 松开（下拉） */
+  static uint8_t  s_stable = 0u;
+
+  const uint8_t raw = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) ? 1u : 0u;
+  const uint32_t now = HAL_GetTick();
+
+  if (raw != s_raw) {              /* 抖：重新计时 */
+    s_raw = raw;
+    s_change_ms = now;
+    return;
+  }
+  if (s_stable != raw && (uint32_t)(now - s_change_ms) >= 20u) {
+    s_stable = raw;
+    synth_module_key((s_stable == 1u) ? 1u : 0u);   /* 高 = 按下 → 传 1 */
+  }
 }
 
 /* USB 内核时钟频率。⚠ 不能用 HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_USB)：
@@ -423,6 +489,16 @@ static void App_ZeroDtcmBss(void)
    返回 0 = 成功；负数 = 停在第几步，调用方把它记进 APP_FAULT_QSPI_MM。 */
 static int App_QspiEnterMemoryMapped(void)
 {
+  /* 统一走 qspi_flash.c 的实现：只有那里维护 s_mmap 状态，间接读/擦写之后才能把
+     内存映射恢复回来。main.c 自己再实现一份会让状态跟踪失效 —— 2026-10-20 的
+     模块加载 BusFault（BFAR = 0x907F0000）就是这条链：导入器 skip 分支间接读之后
+     控制器留在了空闲态，随后用映射指针读头部就吃了 AHB 错误。 */
+  const int rc = synth_port_qspi_enter_mmap();
+  g_app_status.qspi_id = synth_port_qspi_id();
+  return rc;
+
+  /* 以下为旧的内联实现（已由上面一行取代，保留作对照，不参与编译） */
+#if 0
   QSPI_CommandTypeDef      cmd = {0};
   QSPI_MemoryMappedTypeDef mm  = {0};
   uint8_t  id[3] = {0u, 0u, 0u};
@@ -531,6 +607,108 @@ static int App_QspiEnterMemoryMapped(void)
     return -11;
   }
 
+  return 0;
+#endif
+}
+
+/* ---- QSPI 数据通路自检：擦一页 → 写图案 → 回内存映射 → 从 0x90000000 读回比对 --------
+   为什么需要：在此之前只验证过"读 JEDEC ID"（0x9F），而**内存映射的数据通路**从没验证过；
+   而 Synth/port/sample_storage_qspi.c 是零拷贝直接读 0x90000000 的 —— 这一步过了，
+   8 MB QSPI 才能当采样/音色库用。用的是最后一个 4 KB 扇区（偏移 0x7FF000，目前没有任何数据）。
+   结果写进 g_app_status.qspi_wtest（0 = 全对）/ qspi_wtest_rd。 */
+#define APP_QSPI_WTEST_OFFSET  0x7FF000u
+static const uint8_t kQspiPattern[16] = {
+  0x53u, 0x59u, 0x4Eu, 0x51u, 0x00u, 0x11u, 0x22u, 0x33u,   /* "SYNQ" + 递增图案 */
+  0x44u, 0x55u, 0x66u, 0x77u, 0x88u, 0x99u, 0xAAu, 0xBBu
+};
+
+/* 填公共命令字段（单线指令 / 无数据），返回后调用方覆盖需要变的项 */
+static void App_QspiCmdInit(QSPI_CommandTypeDef *cmd)
+{
+  memset(cmd, 0, sizeof(*cmd));
+  cmd->InstructionMode    = QSPI_INSTRUCTION_1_LINE;
+  cmd->AddressMode        = QSPI_ADDRESS_NONE;
+  cmd->AddressSize        = QSPI_ADDRESS_24_BITS;
+  cmd->AlternateByteMode  = QSPI_ALTERNATE_BYTES_NONE;
+  cmd->AlternateBytesSize = QSPI_ALTERNATE_BYTES_8_BITS;
+  cmd->DataMode           = QSPI_DATA_NONE;
+  cmd->NbData             = 0u;
+  cmd->DummyCycles        = 0u;
+  cmd->DdrMode            = QSPI_DDR_MODE_DISABLE;
+  cmd->DdrHoldHalfCycle   = QSPI_DDR_HHC_ANALOG_DELAY;
+  cmd->SIOOMode           = QSPI_SIOO_INST_EVERY_CMD;
+}
+
+static int App_QspiWriteEnable(void)      /* 0x06：擦/写之前必须先发 */
+{
+  QSPI_CommandTypeDef cmd;
+  App_QspiCmdInit(&cmd);
+  cmd.Instruction = 0x06u;
+  return (HAL_QSPI_Command(&hqspi, &cmd, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) == HAL_OK) ? 0 : -1;
+}
+
+static int App_QspiWaitWip(void)          /* 轮询 SR1.WIP(bit0)，最多 ~500 ms */
+{
+  QSPI_CommandTypeDef cmd;
+  uint8_t sr1 = 0xFFu;
+  App_QspiCmdInit(&cmd);
+  cmd.Instruction = 0x05u;
+  cmd.DataMode    = QSPI_DATA_1_LINE;
+  cmd.NbData      = 1u;
+  for (uint32_t i = 0u; i < 500u; ++i) {
+    if (HAL_QSPI_Command(&hqspi, &cmd, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return -1;
+    if (HAL_QSPI_Receive(&hqspi, &sr1, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return -2;
+    if ((sr1 & 0x01u) == 0u) return 0;
+    HAL_Delay(1u);
+  }
+  return -3;
+}
+
+/* 用开关 SYNTH_PORT_QSPI_WRITE_TEST 启用；关掉时保留代码但不参与编译（unused 抑制警告） */
+static int __attribute__((unused)) App_QspiWriteTest(void)
+{
+  QSPI_CommandTypeDef cmd;
+  uint8_t rd[16];
+
+  /* 已经在内存映射状态时 HAL 不收普通命令，先退出来 */
+  if (hqspi.State == HAL_QSPI_STATE_BUSY_MEM_MAPPED) {
+    (void)HAL_QSPI_Abort(&hqspi);
+  }
+
+  /* 1) 擦除 4 KB 扇区（0x20 + 24 位地址） */
+  if (App_QspiWriteEnable() != 0) return -1;
+  App_QspiCmdInit(&cmd);
+  cmd.Instruction = 0x20u;
+  cmd.Address     = APP_QSPI_WTEST_OFFSET;
+  cmd.AddressMode = QSPI_ADDRESS_1_LINE;
+  if (HAL_QSPI_Command(&hqspi, &cmd, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return -2;
+  if (App_QspiWaitWip() != 0) return -3;
+
+  /* 2) 页编程（0x02），16 字节 */
+  if (App_QspiWriteEnable() != 0) return -4;
+  cmd.Instruction = 0x02u;
+  cmd.DataMode    = QSPI_DATA_1_LINE;
+  cmd.NbData      = (uint32_t)sizeof(kQspiPattern);
+  if (HAL_QSPI_Command(&hqspi, &cmd, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return -5;
+  if (HAL_QSPI_Transmit(&hqspi, (uint8_t *)kQspiPattern, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return -6;
+  if (App_QspiWaitWip() != 0) return -7;
+
+  /* 3) 回内存映射模式（读回必须走映射路径，不然证明不了数据通路） */
+  if (App_QspiEnterMemoryMapped() != 0) return -8;
+
+  /* 3b) 0x90000000 现在是可缓存区：刚写进去的数据要先让缓存失效，否则读回的是旧行 */
+  synth_port_qspi_cache_invalidate();
+
+  /* 4) 从映射窗口读回比对 */
+  {
+    const volatile uint8_t *p = (const volatile uint8_t *)(APP_QSPI_MAP_BASE + APP_QSPI_WTEST_OFFSET);
+    for (uint32_t i = 0u; i < sizeof(kQspiPattern); ++i) rd[i] = p[i];
+  }
+  g_app_status.qspi_wtest_rd = ((uint32_t)rd[0]) | ((uint32_t)rd[1] << 8) |
+                               ((uint32_t)rd[2] << 16) | ((uint32_t)rd[3] << 24);
+  for (uint32_t i = 0u; i < sizeof(kQspiPattern); ++i) {
+    if (rd[i] != kQspiPattern[i]) return -9;
+  }
   return 0;
 }
 
@@ -747,9 +925,24 @@ static int App_SdInit(void)
                                   "ClockDiv >= sdmmc_clk/(2*25MHz)"（48 MHz 时 = 0）判真，于是把
                                   CLKDIV 写成 0 = 分频旁路（48 MHz 直接怼卡），实测表现为
                                   HAL 返回 RX_OVERRUN(32) → f_mount 报 FR_DISK_ERR(1)。 */
+  /* SDMMC 的 IDMA 完成靠中断通知（FatFs 的读写已改走 DMA，见 FATFS/Target/sd_diskio.c）：
+     优先级 6 —— 低于音频 DMA(0) 与 USB(5)。IDMA 自己搬数据，CPU 晚几百微秒响应只是慢一点，
+     不会像轮询模式那样被音频中断抢占到 FIFO 溢出。 */
+  HAL_NVIC_SetPriority(SDMMC1_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(SDMMC1_IRQn);
+
   return (HAL_SD_Init(&hsd1) == HAL_OK) ? 0 : -1;
 }
 #endif
+
+/* SDMMC1 中断：HAL_SD_IRQHandler() 在里面调 BSP_SD_ReadCpltCallback()/WriteCpltCallback()，
+   FatFs 的 SD 读写（FATFS/Target/sd_diskio.c 里的 DMA 版本）就在等这个回调清忙标志。
+   注意：CubeMX 的 Core/Src/sdmmc.c 不生成这个函数；以后若在 CubeMX 里勾了 SDMMC1 的 NVIC，
+   它会在 Core/Src/stm32h7xx_it.c 生成一份，届时删掉那一份（否则重复定义编译不过）。 */
+void SDMMC1_IRQHandler(void)
+{
+  HAL_SD_IRQHandler(&hsd1);
+}
 
 #if SYNTH_PORT_SD_ENABLE   /* App_SdTryPowerMode 依赖上面的 App_SdInit()，只在 SD 编进来时才编译 */
 /* 把 PD4（MicroSD_SW）按指定状态配好再试一次初始化 —— 曾经用来验证"PD4 是不是卡座电源"，
@@ -878,14 +1071,10 @@ int main(void)
   dbg_log("boot", "sysclk=%lu Hz hclk=%lu Hz pclk2=%lu Hz",
           (unsigned long)SystemCoreClock, (unsigned long)HAL_RCC_GetHCLKFreq(),
           (unsigned long)HAL_RCC_GetPCLK2Freq());
-  dbg_log("boot", "boot_count=%lu reset_flags=0x%08lX [POR=%lu PIN=%lu SFT=%lu CPU=%lu D1=%lu BOR=%lu]",
-          (unsigned long)g_app_status.boot_count, (unsigned long)g_app_status.reset_flags,
-          (unsigned long)((g_app_status.reset_flags >> 23) & 1u),   /* PORRSTF 上电 */
-          (unsigned long)((g_app_status.reset_flags >> 22) & 1u),   /* PINRSTF 复位键 */
-          (unsigned long)((g_app_status.reset_flags >> 24) & 1u),   /* SFTRSTF 软件复位 */
-          (unsigned long)((g_app_status.reset_flags >> 17) & 1u),   /* CPURSTF */
-          (unsigned long)((g_app_status.reset_flags >> 19) & 1u),   /* D1RSTF */
-          (unsigned long)((g_app_status.reset_flags >> 21) & 1u));  /* BORRSTF 欠压 */
+  /* 复位原因逐位展开太占 flash（调试版只剩几百字节），要看请用 tools\status.ps1
+     的 reset_flags 字段（那里会解码成 POR/PIN/SFT/CPU/D1/BOR）。 */
+  dbg_log("boot", "boot_count=%lu reset_flags=0x%08lX",
+          (unsigned long)g_app_status.boot_count, (unsigned long)g_app_status.reset_flags);
   if (g_fault.count != 0u) {
     dbg_log("boot", "上次运行进过 HardFault（count=%lu）；g_fault 里还留着现场", (unsigned long)g_fault.count);
   }
@@ -906,12 +1095,11 @@ int main(void)
   MX_DMA_Init();
   MX_GPIO_Init();
   App_LedInit();                        /* PE3 心跳灯（诊断用，见 App_LedTask） */
+  App_KeyInit();                        /* PC13 用户键（转发给 RAM overlay 模块） */
   MX_QUADSPI_Init();                    /* 配 QUADSPI 参数；进内存映射在下面第 5 步 */
-#if SYNTH_PORT_SD_ENABLE
-  if (HAL_GPIO_ReadPin(MicroSD_SW_GPIO_Port, MicroSD_SW_Pin) == GPIO_PIN_RESET) {  /* 低 = 卡在座 */
-    MX_SDMMC1_SD_Init();
-  }
-#endif
+  /* SD 卡初始化在下面第 8 步用 App_SdInit() 做（允许失败、失败只记 -3）：
+     生成的 MX_SDMMC1_SD_Init() 里 HAL_SD_Init() 失败会直接 Error_Handler，
+     没插卡时会把整块板子停在 while(1) 里（USB 不枚举、没声音）。 */
   MX_FATFS_Init();
 
   /* 4) 音频通路：SAI3 + MCLK 补丁 + GPIO 速度 + 时钟自检 */
@@ -928,6 +1116,23 @@ int main(void)
   dbg_log("qspi", "memory-mapped %s, JEDEC id=0x%06lX",
           ((g_app_status.fault & APP_FAULT_QSPI_MM) == 0u) ? "OK" : "FAILED",
           (unsigned long)g_app_status.qspi_id);
+
+  /* 5b) 数据通路自检（默认关，见 SYNTH_PORT_QSPI_WRITE_TEST）：擦最后一个 4 KB 扇区 →
+         写 16 字节图案 → 从 0x90000000 读回比对。只验证过"读 ID"是不够的 ——
+         Synth/port/sample_storage_qspi.c 是**零拷贝直读映射窗口**的，这一步过了才能放心把
+         采样/音色库放进 QSPI。0 = 全对，负数 = 第几步失败（见字段注释）。
+         该扇区（0x7FF000）已被自检占用，采样库别放那儿。 */
+#if SYNTH_PORT_QSPI_WRITE_TEST
+  if ((g_app_status.fault & APP_FAULT_QSPI_MM) == 0u) {
+    g_app_status.qspi_wtest = (uint32_t)App_QspiWriteTest();
+    dbg_log("qspi", "write/read-back test: %ld (read=0x%08lX, expect 0x514E5953)",
+            (long)(int32_t)g_app_status.qspi_wtest, (unsigned long)g_app_status.qspi_wtest_rd);
+  } else {
+    g_app_status.qspi_wtest = 0x7FFFFFFFu;   /* 没进内存映射，跳过自检 */
+  }
+#else
+  g_app_status.qspi_wtest = 0x7FFFFFFFu;     /* 自检未开启（已于 2026-10-19 验证通过） */
+#endif
 
   /* 6) 引擎与端口层。synth_port_init() 里做的事：开 D-Cache、FPU 置 flush-to-zero、
         使能 DWT 周期计数、选 USB 内核时钟、装平台钩子（见 Synth/port/platform_stm32.c）。 */
@@ -950,23 +1155,11 @@ int main(void)
   dbg_log("init", "synth_init=%ld (0=OK), patch=%lu", (long)g_app_status.synth_init,
           (unsigned long)synth_get_patch_index());
 
-  /* 7) 起音频 DMA：先渲染两个半缓冲再启动，之后由 SAI3_B 的 DMA 半传输/传输完成中断续渲染 */
-  g_app_status.audio_start = synth_port_audio_start();
-  if (g_app_status.audio_start != 0) {
-    App_Fault(APP_FAULT_AUDIO_START);
-  }
-  dbg_log("sai", "audio_start=%ld (0=OK)", (long)g_app_status.audio_start);
+  /* 7) USB-MIDI 放到 SD 之后（见步骤 8 末尾）：QSPI 采样库导入要擦写好几十秒，
+     这期间主循环还没开始跑（tud_task 不会被调用），如果 USB 已经拉起来，
+     主机会看到"枚举了但不响应"的设备并可能报错。tusb_init() 之前 OTG 核不上拉。 */
 
-  /* 8) USB-MIDI（TinyUSB，设备模式 FS） */
-  g_app_status.usb_init = synth_port_usb_init();
-  if (g_app_status.usb_init != 0) {
-    App_Fault(APP_FAULT_USB_INIT);
-  }
-  dbg_log("usb", "tusb_init=%ld (0=OK), usb_clk=%lu Hz", (long)g_app_status.usb_init,
-          (unsigned long)App_UsbKernelClockHz());
-  dbg_log("boot", "==== 进入主循环（等主机枚举 + MIDI 输入）====");
-
-  /* 9) SD 卡：只有 Synth/port/synth_port_config.h 里 SYNTH_PORT_SD_ENABLE = 1 时才编进来。
+  /* 8) SD 卡：只有 Synth/port/synth_port_config.h 里 SYNTH_PORT_SD_ENABLE = 1 时才编进来。
      为什么不用 MX_SDMMC1_SD_Init()：CubeMX 生成的 Core/Src/sdmmc.c 在 HAL_SD_Init() 失败时直接
      Error_Handler()（整块板停在 while(1)：USB 不枚举、没声音）。没插卡时 HAL_SD_Init() 必定失败，
      所以这里自己配同样的参数但**允许失败** —— 没卡就当作"没有 SD"，合成器照常工作。
@@ -998,14 +1191,78 @@ int main(void)
          用 tools/status.ps1 读；位含义见 Synth/port/patch_storage_sd.c 顶部注释。 */
       g_app_status.sd_selftest = synth_port_sd_selftest();
       g_app_status.sd_exported = synth_port_sd_exported();
-      dbg_log("sd", "mounted (dat3=%lu), selftest=0x%lx exported=%lu",
+      /* QSPI 采样库导入（第三档）：卡上 /synth/samples.bin 的 serial 与板上库不同就导入。
+         必须赶在起音频之前（导入要擦写几十秒）；serial 相同则立刻返回。 */
+      g_app_status.lib_import = (uint32_t)synth_port_lib_import_from_card();
+      dbg_log("lib", "import=%ld count=%lu serial=0x%lx",
+              (long)(int32_t)g_app_status.lib_import,
+              (unsigned long)synth_port_lib_count(), (unsigned long)synth_port_lib_serial());
+      /* 开机恢复"每个通道用哪个音色号"（/synth/state.cfg），并立刻让 patch_service 把卡上
+         对应的 .syn 取进来 —— 必须赶在音频 DMA 启动之前做完（见下面步骤 7 的说明）。 */
+      g_app_status.state_load = (uint32_t)synth_port_state_load();
+      synth_port_patch_service();
+      /* 覆盖自检（默认关，见 SYNTH_PORT_SD_WRITE_TEST）：证明"卡上的内容说了算"
+         （写改过的 000.syn → 读回确认 → 恢复原件）。位含义见 Synth/port/patch_storage_sd.c；
+         开启时期望 0x0F。 */
+#if SYNTH_PORT_SD_WRITE_TEST
+      g_app_status.sd_wtest = synth_port_sd_write_test();
+#else
+      g_app_status.sd_wtest = 0x80000000u;   /* 自检未开启（已于 2026-10-19 验证通过 = 0x0F） */
+#endif
+      dbg_log("sd", "mounted (dat3=%lu), selftest=0x%lx exported=%lu wtest=0x%lx",
               (unsigned long)g_app_status.sd_dat3,
-              (unsigned long)g_app_status.sd_selftest, (unsigned long)g_app_status.sd_exported);
+              (unsigned long)g_app_status.sd_selftest, (unsigned long)g_app_status.sd_exported,
+              (unsigned long)g_app_status.sd_wtest);
     }
   }
 #else
   g_app_status.sd_mount = -1;
 #endif
+
+  /* 8b) QSPI 采样库状态：不管有没有 SD 都读一次（库可能是上次导入的，也可能被自检覆盖过）。
+         用 tools/status.ps1 看 lib_count / lib_serial / lib_import。 */
+  g_app_status.lib_count  = synth_port_lib_count();
+  g_app_status.lib_serial = synth_port_lib_serial();
+#if SYNTH_PORT_LIB_SELFTEST_ON_BOOT
+  /* 没有 PC 打包文件时用它验证整条链路（见 synth_port_config.h 的说明）：造小库 → 写 QSPI
+     → 重新枚举，发 PC 120 应该听到 93.75 Hz 的正弦。会覆盖真库，验证完记得关掉。 */
+  if (g_app_status.lib_count == 0u) {
+      const int lib_rc = synth_port_lib_selftest();
+      dbg_log("lib", "selftest rc=%d count=%lu serial=0x%lx", lib_rc,
+              (unsigned long)synth_port_lib_count(), (unsigned long)synth_port_lib_serial());
+      g_app_status.lib_count  = synth_port_lib_count();
+      g_app_status.lib_serial = synth_port_lib_serial();
+  }
+#endif
+
+  /* 8d) RAM overlay 模块（TFT UI 等）：卡上 /synth/ui.bin 的 build_id/CRC 与板上不同就写进
+         QSPI 0x7F0000，然后校验并整段拷到 AXI SRAM 顶部执行。模块是可选的：失败只记录，
+         不影响音频/MIDI（module_state 见 Synth/port/module.h）。 */
+  g_app_status.module_import = (uint32_t)synth_port_module_import_from_card();
+  g_app_status.module_state  = -6;   /* -6 = 还没走到（万一 init 崩了，status 不会误报 0 = 已加载） */
+  g_app_status.module_state  = (int32_t)synth_module_init();
+  g_app_status.module_crc    = synth_module_crc();
+  dbg_log("mod", "import=%ld state=%ld crc=0x%lx", (long)(int32_t)g_app_status.module_import,
+          (long)g_app_status.module_state, (unsigned long)g_app_status.module_crc);
+
+  /* 8c) USB-MIDI（TinyUSB，设备模式 FS）：放在库导入/SD 之后，避免主机在导入期间
+         看到一个"枚举成功但不响应"的设备。 */
+  g_app_status.usb_init = synth_port_usb_init();
+  if (g_app_status.usb_init != 0) {
+    App_Fault(APP_FAULT_USB_INIT);
+  }
+  dbg_log("usb", "tusb_init=%ld (0=OK), usb_clk=%lu Hz", (long)g_app_status.usb_init,
+          (unsigned long)App_UsbKernelClockHz());
+  dbg_log("boot", "==== 进入主循环（等主机枚举 + MIDI 输入）====");
+
+  /* 9) 起音频 DMA —— **故意放在 SD 之后**：卡上的音色映射（state.cfg + /synth/NNN.syn）要在
+        出声之前全部就位；否则开机读卡会占住主循环，预渲染环喂不上（实测 audio_underruns +10）。
+        先渲染两个半缓冲再启动，之后由 SAI3_B 的 DMA 半传输/传输完成中断续渲染。 */
+  g_app_status.audio_start = synth_port_audio_start();
+  if (g_app_status.audio_start != 0) {
+    App_Fault(APP_FAULT_AUDIO_START);
+  }
+  dbg_log("sai", "audio_start=%ld (0=OK)", (long)g_app_status.audio_start);
 
   /* 10) 时钟自检结果（调试器里看 g_app_status）：
           sysclk 480 MHz / hclk 240 MHz / usb 48 MHz / audio 24.576 MHz / MCKDIV 2 / qspi_id 0xEF4017 */
@@ -1030,10 +1287,23 @@ int main(void)
     g_app_status.main_stage = 1u;
     synth_port_usb_task();
     g_app_status.main_stage = 2u;
+    (void)synth_port_lib_service();  /* QSPI 库优先：主 PC 命中库里的乐器就零拷贝挂载 */
     synth_port_patch_service();
+    synth_port_state_service();   /* 通道音色映射变了 → 静默 2 s 后写回 /synth/state.cfg */
     g_app_status.main_stage = 3u;
     synth_service();
+    synth_module_tick();          /* RAM overlay 模块（TFT UI）：100 Hz 节流，模块自己画屏 */
+    App_KeyTask();                /* PC13 消抖 → synth_module_key() */
     g_app_status.main_stage = 0u;
+
+    /* 模块状态（module_ticks 不涨 = 模块自己的 tick 卡住了；probe 由模块定义）。
+       state/crc 也要每圈刷新：USB 上传新镜像后会卸载+重新加载，开机时那一次的值就过期了。 */
+    g_app_status.module_state    = (int32_t)synth_module_state();
+    g_app_status.module_crc      = synth_module_crc();
+    g_app_status.module_ticks    = synth_module_ticks();
+    g_app_status.module_probe[0] = g_module_probe[0];
+    g_app_status.module_probe[1] = g_module_probe[1];
+    g_app_status.up_state        = synth_port_module_upload_state();
 
     /* 心跳与诊断：LED 编码状态（见 App_LedTask），USB 寄存器快照只在未枚举时刷新。
        loop_count 不涨 = 主循环卡死（而不是"USB 谈不拢"）。 */
@@ -1045,14 +1315,18 @@ int main(void)
     g_app_status.usb_isr_depth   = g_synth_usb_isr_depth;
     g_app_status.audio_isr_depth = g_synth_audio_isr_depth;
 
-    /* 负载指标（读引擎内部统计；用来验证"复音多"时是否还有余量） */
+    /* 负载指标（读引擎内部统计；用来验证"复音多"时是否还有余量）+ MIDI 控制面计数 */
     {
       synth_stats_t st;
       synth_get_stats(&st);
       g_app_status.cpu_permille       = synth_cpu_load_permille();
       g_app_status.render_peak_cycles = st.render_peak_cycles;
+      g_app_status.nrpn_used          = st.nrpn_used;
+      g_app_status.nrpn_unmapped      = st.nrpn_unmapped;
+      g_app_status.last_nrpn          = st.last_nrpn;
     }
     g_app_status.audio_underruns = g_synth_audio_underruns;
+    g_app_status.state_saves     = synth_port_state_save_count();
 
     /* 多音色映射：16 个通道的音色号打包成 4 个字（每通道 4 bit，15 = 未知/越界） */
     for (uint32_t w = 0; w < 4u; ++w) {
@@ -1093,36 +1367,21 @@ int main(void)
     {
       static uint32_t s_stat_ms = 0u;
       static uint32_t s_loop_prev = 0u;
-      static uint32_t s_prog_ms = 0u;
-      static uint32_t s_prog_count = 0u;
       const uint32_t now = HAL_GetTick();
 
-      if (g_app_status.loop_count != s_prog_count) {
-        s_prog_count = g_app_status.loop_count;
-        s_prog_ms = now;
-      } else if ((now - s_prog_ms) >= 200u) {
-        s_prog_ms = now;                       /* 每 200 ms 报一次，避免刷屏 */
-        dbg_log("STALL", "主循环 200ms 没推进：stage=%lu usb_isr=%lu audio_isr=%lu systick=%lu",
-                (unsigned long)g_app_status.main_stage,
-                (unsigned long)g_app_status.usb_isr_depth,
-                (unsigned long)g_app_status.audio_isr_depth,
-                (unsigned long)g_synth_systick_ticks);
-      }
-
+      /* 卡死检测留给 tools\status.ps1（loop_count 不涨就是卡了，还能看到 stage/中断深度），
+         这里只保留每秒一行统计 —— 调试版 flash 只剩一百多字节，字符串省着用。 */
       if ((now - s_stat_ms) >= 1000u) {
         synth_stats_t st;
         const uint32_t cpu = synth_cpu_load_permille();
         synth_get_stats(&st);
-        dbg_log("stat", "loop=%lu/s voices=%u/%u on=%lu steal=%lu midi=%lu drop=%lu cc=%lu xy=%lu boom=%lu cpu=%lu.%lu%% xrun=%lu snd=%lu",
+        dbg_log("stat", "loop=%lu voices=%u/%u midi=%lu drop=%lu cc=%lu cpu=%lu.%lu%% xrun=%lu",
                 (unsigned long)(g_app_status.loop_count - s_loop_prev),
                 (unsigned)st.active_voices, (unsigned)st.peak_voices,
-                (unsigned long)st.notes_on, (unsigned long)st.steals,
                 (unsigned long)st.midi_bytes, (unsigned long)st.midi_dropped,
-                (unsigned long)st.unknown_cc, (unsigned long)st.sysex_dropped,
-                (unsigned long)st.render_peak_cycles,
+                (unsigned long)st.unknown_cc,
                 (unsigned long)(cpu / 10u), (unsigned long)(cpu % 10u),
-                (unsigned long)g_synth_audio_xruns,
-                (unsigned long)g_app_status.main_stage);
+                (unsigned long)g_synth_audio_xruns);
         s_stat_ms = now;
         s_loop_prev = g_app_status.loop_count;
       }
@@ -1178,7 +1437,11 @@ void MPU_Config(void)
   MPU_InitStruct.BaseAddress = 0x90000000;
   MPU_InitStruct.Size = MPU_REGION_SIZE_8MB;
   MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
-  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  /* 可缓存（2026-10-19 改）：采样零拷贝播放从这块地址取数据，命中 D-Cache 后基本免费；
+     非缓存时每次采样点都要真的去 flash（24 MB/s 上限）。只读 + 不可执行，写入只走
+     HAL_QSPI 间接模式（不经过这条映射），所以缓存安全 —— 导入完成后清一次 cache 即可
+     （synth_port_qspi_cache_invalidate()）。 */
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_CACHEABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
   /* Enables the MPU */

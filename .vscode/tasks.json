@@ -1,0 +1,162 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "构建 (RelWithDebInfo)",
+			"detail": "tools/build.ps1 —— -O2 -g，日常上板用的构建类型",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/build.ps1"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		},
+		{
+			"label": "构建 (Debug)",
+			"detail": "-O0 -g，单步调试用；128KB flash 会很紧张",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/build.ps1",
+				"-BuildType",
+				"Debug"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		},
+		{
+			"label": "构建 (Release)",
+			"detail": "-O2 -DNDEBUG，看 flash 余量时用",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/build.ps1",
+				"-BuildType",
+				"Release"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "重新配置并构建 (Clean)",
+			"detail": "删掉 build/<类型> 重新配置（换了生成器/工具链后用）",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/build.ps1",
+				"-Clean"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "下载到开发板",
+			"detail": "tools/flash.ps1 —— OpenOCD + CMSIS-DAP，自动挑最新的 ELF",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/flash.ps1"
+			],
+			"group": "build",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		},
+		{
+			"label": "构建并下载",
+			"detail": "一条命令走完 配置 → 编译 → 下载 → 校验 → 复位运行",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/build.ps1",
+				"-Flash"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		},
+		{
+			"label": "读取板子状态",
+			"detail": "tools/status.ps1 —— 用调试器读回 g_app_status 并解码（时钟/USB/故障位/复位循环）",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/tools/status.ps1"
+			],
+			"group": "build",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		}
+		,
+		{
+			"label": "上传 UI 模块 (USB)",
+			"detail": "python tools/upload_module.py —— 把 build\\RelWithDebInfo\\ui.bin 通过 USB-MIDI SysEx 灌进板子（不用拔卡/烧写）",
+			"type": "shell",
+			"command": "python",
+			"args": ["tools/upload_module.py", "--device", "1"],
+			"options": { "cwd": "${workspaceFolder}" },
+			"problemMatcher": [],
+			"presentation": { "reveal": "always", "panel": "shared", "clear": true }
+		}	]
+}

@@ -1,18 +1,80 @@
-# build outputs
+# ════════════════════════════════════════════════════════════════════════
+#  STM32synthesizer —— 公开仓库用 .gitignore
+#  原则：源码 / CubeMX 工程文件 / 脚本 / 文档 入库；
+#        构建产物、采样音源、第三方研究副本、本机配置、生成物 全部忽略。
+# ════════════════════════════════════════════════════════════════════════
+
+# ── 构建产物 ───────────────────────────────────────────────────────────
 build/
-build-mingw/
+build-*/
+build_*/
+cmake-build-*/
 host/build/
+tests/build/
+.cmtest/
+build_size/
+
+# 编译器 / 链接器输出
 *.o
 *.obj
+*.a
+*.lib
 *.elf
 *.hex
 *.bin
 *.map
-# editor / OS
-.vscode/
+*.su
+*.d
+*.i
+
+# CMake / Ninja / Make 的缓存与中间件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+Makefile
+
+# ── 生成物 / 用户数据 ──────────────────────────────────────────────────
+# 采样音源：几百 MB ~ 几 GB，且多为第三方授权，只在本地放（打包成 samples.bin）
+samples/
+samples.bin
+# Python 字节码
+*.pyc
+*.pyo
+__pycache__/
+
+# ── 第三方研究副本（本地克隆，需要时自行 clone）─────────────────────────
+# dxsyx / msfa-android / synth_dexed 是为对照研究克隆的，体积大、来源与许可各异，
+# 不随本仓库分发（构建本工程不需要它们）。
+docs/research/dxsyx/
+docs/research/msfa-android/
+docs/research/synth_dexed/
+docs/research/build*/
+docs/research/**/*.o
+
+# ── 编辑器 / 操作系统 ───────────────────────────────────────────────────
+.vscode/*
+# 构建 / 下载 / 上传 / 读状态 —— 共享
+!.vscode/tasks.json
+# cortex-debug 调试配置 —— 共享
+!.vscode/launch.json
+# 推荐插件 —— 共享
+!.vscode/extensions.json
 .idea/
 *.uvguix.*
+*.swp
+*~
+.DS_Store
 Thumbs.db
-# research artifacts fetched by tooling
-docs/research/**/build*/
-docs/research/**/*.o
+desktop.ini
+
+# ── 日志 / 临时文件 ─────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+_live/
+scratch/

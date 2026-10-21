@@ -28,7 +28,9 @@ extern "C" {
 #define CFG_TUD_AUDIO               0
 #define CFG_TUD_VENDOR              0
 
-#define CFG_TUD_MIDI_RX_BUFSIZE     64
+/* RX 放大到 1 KB：用 SysEx 上传模块镜像时主机会一口气灌几 KB，
+   64 B 的 FIFO 容易溢出丢包（协议本身可重发，但没必要丢） */
+#define CFG_TUD_MIDI_RX_BUFSIZE     1024
 #define CFG_TUD_MIDI_TX_BUFSIZE     64
 #define CFG_TUD_MIDI_EP_BUFSIZE     64
 

@@ -16,6 +16,7 @@
 #if SYNTH_PORT_USB_ENABLE
 #include "tusb.h"
 #include "debug_uart.h"
+#include "module_upload.h"   /* SysEx 上传模块镜像：先过滤协议字节，再喂引擎 */
 
 /* 诊断计数：收到的 MIDI 字节总数。调试器里盯着它，弹一下琴键就会涨；
    不涨 = USB→引擎 这条路没通（枚举失败，或主机没往 OUT 端点发数据）。 */
@@ -120,14 +121,20 @@ void tud_midi_rx_cb(uint8_t itf) {
         const uint8_t cin = (uint8_t)(pkt[0] & 0x0Fu);
         const uint8_t n   = kCinBytes[cin];
         for (uint8_t i = 0; i < n; ++i) bytes[i] = pkt[1 + i];
-        g_synth_midi_rx_bytes += n;
 #if SYNTH_PORT_MIDI_TRACE
         /* 每个事件包一行：CIN + 3 个原始字节。判断"音停不下来"的第一手材料 ——
            note-on（9n）之后有没有对应的 note-off（8n）或 velocity=0 的 9n 到达。 */
         dbg_log("midi", "cin=%X %02X %02X %02X n=%u", (unsigned)cin,
                 (unsigned)bytes[0], (unsigned)bytes[1], (unsigned)bytes[2], (unsigned)n);
 #endif
-        synth_midi_in(bytes, n);
+        /* SysEx 上传模块镜像的协议字节不送引擎；普通 MIDI 原样通过（顺序不变） */
+        uint8_t pass[3];
+        uint8_t np = 0u;
+        for (uint8_t i = 0; i < n; ++i) {
+            if (!synth_port_module_upload_byte(bytes[i])) pass[np++] = bytes[i];
+        }
+        g_synth_midi_rx_bytes += np;
+        if (np != 0u) synth_midi_in(pass, np);
     }
 }
 

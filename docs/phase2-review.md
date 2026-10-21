@@ -301,3 +301,114 @@ running status —— 收到 MTC Quarter Frame/Song Select 后会多吃一个字
 
 验证：发 `0xF1 0x40`、`0xF2 0x10 0x02`、`0xF3 0x07`、`0xF6`、`0xF8`、`0xFA`、`0xFC`、`0xFE`
 与一个孤立数据字节 `0x40`，随后一条正常 note on/off 仍正常、`fault=0`。
+
+## 12. SD 卡打通（2026-10-19）
+
+现象链：换 32 GB 卡后 `HAL_SD_Init()` 一次成功（`ErrorCode = 0`、SDHC、61,132,800 块 × 512 B
+= 31.3 GB），但 `f_mount()` 先报 `FR_NOT_READY(3)`、改完又报 `FR_DISK_ERR(1)`。三个根因：
+
+1. **卡检测判断错**：`FATFS/Target/fatfs_platform.c:21-32` 的 `BSP_PlatformIsDetected()` 按
+   "PD4 不为低 = 没卡"判断 —— 本板 PD4 恒为高（实测 `GPIOD->IDR = 0x2010`，WeAct 官方
+   04-SD_Test 例程也没有任何检测脚）⇒ 插好的卡被判成不存在，`disk_status()` 直接返回
+   `STA_NOINIT`。改成无条件 `return SD_PRESENT`，卡在不在交给 `HAL_SD_Init()` 说话。
+2. **DAT3 与 4-bit 传输抢线**：早期为旧卡做的 `App_SdHoldDat3High()`（把 PC11 当 GPIO 输出高）
+   还留着，而 `FATFS/Target/bsp_driver_sd.c:56` 的 `BSP_SD_Init()` 之后会
+   `HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B)`（实测 `SDMMC1->CLKCR = 0x4000`
+   = 4-bit）。已删除该函数与调用，`App_SdInit()` 恢复 `SDMMC_BUS_WIDE_4B`。
+3. **数据时钟分频写成 0**：`hsd1.Init.ClockDiv = 0`（CubeMX 生成值）在 48 MHz 内核下让 HAL 的
+   `HAL_SD_ConfigWideBusOperation()`（`stm32h7xx_hal_sd.c:2469`）判定
+   `hsd->Init.ClockDiv >= sdmmc_clk/(2*25MHz)`（= 0）成立，于是把 `CLKCR.CLKDIV` 写成 0
+   = **分频旁路**（48 MHz 直接怼卡，超过默认速率 25 MHz 上限）⇒ HAL 返回
+   `HAL_SD_ERROR_RX_OVERRUN`(32) → `FR_DISK_ERR`。现在写 `ClockDiv = 1` → 数据阶段 24 MHz；
+   识别阶段不受影响（`HAL_SD_InitCard`，`stm32h7xx_hal_sd.c:485-497`，自己算出 CLKDIV = 61 = 393 kHz）。
+
+诊断入口（都进了 `tools/status.ps1`）：
+- `sd_mount` 现在返回真实 `FRESULT`（0 = 已挂载 / -3 = 卡初始化失败 / 1 = FR_DISK_ERR / 3 = FR_NOT_READY / 13 = FR_NO_FILESYSTEM）；
+- `sd_err` = 失败时的 `hsd1.ErrorCode`（逐位：4 = CMD_RSP_TIMEOUT、8 = DATA_TIMEOUT、32 = RX_OVERRUN、2048 = IDMA_ERROR）；
+- `sd_selftest` 位图（`Synth/port/patch_storage_sd.c` 顶部）：bit0 目录 / bit1 写入 / bit2 读回 /
+  bit3 解析（`patch_from_text()` 成功返回的是**字段个数**（`return applied;`），不是 0 —— 自检最初写成
+  `== 0` 所以永远不亮）/ bit4 跳过已存在的文件 / bit5 走真实加载路径。
+
+实测（32 GB 卡与旧卡格式化 FAT32 后均通过）：`sd_mount = 0`、`sd_selftest = 0x2F`（首启）/ `0x3D`（再次上电）、
+首启导出 15 个 `/synth/NNN.syn` 模板、`sd_exported = 15 → 0`、`sd_err = 0`、`fault = 0`。
+MIDI 冒烟：连发 5 个 Program Change（0/3/7/12/14）+ 1 个音符 ⇒ `midi_rx_bytes = 16`（2×5+3+3）、
+`fault` 仍为 0、SD 仍挂载 —— 说明"切音色时从卡加载 `/synth/NNN.syn`"这条路径不会出错。
+
+**旧卡结论修正**：那张吃灰半年的卡不是坏的，格式化成 FAT32 后一次就通；此前它在两套固件上都失败
+（我们的 + `WM8978_Player`），所以当时误判为卡损坏，实际是"旧卡状态 + 旧固件"叠加。
+
+## 13. QSPI 数据通路 + SD「卡上内容说了算」自检（2026-10-19 上板通过）
+
+阶段 3 的两块存储此前都只差"最后一个语义验证"，这次一次跑完。
+
+### 13.1 QSPI 内存映射数据通路（`qspi_wtest`）
+
+此前只验证过读 JEDEC ID（`0x9F` → `0xEF4017`），**映射窗口的数据通路从未验证**，而
+`Synth/port/sample_storage_qspi.c` 是零拷贝直读 `0x90000000` 的。
+
+`Core/Src/main.c` 的新自检 `App_QspiWriteTest()`：`HAL_QSPI_Abort()` 先退出映射状态 →
+`0x06` 写使能 → `0x20` 擦除**最后一个 4 KB 扇区（偏移 `0x7FF000`）** → 轮询 SR1.WIP →
+`0x06` → `0x02` 页编程 16 字节图案 → 轮询 WIP → 重新 `HAL_QSPI_MemoryMapped()`（`0xEB`，1-4-4）→
+从映射地址读回比对（这一步在 `synth_port_init()` 开 D-Cache **之前**，读到的必是 flash 真值）。
+
+结果：`qspi_wtest = 0`（全对）、`qspi_wtest_rd = 0x514E5953`（"SYNQ" 小端）。
+⇒ **8 MB QSPI 可以当采样/音色库用**。约定：最后 4 KB 扇区（`0x7FF000`）归自检用，采样库避开它。
+
+### 13.2 SD 覆盖自检（`sd_wtest`）
+
+前面的自检只能证明"卡上文件读得出来、解析得动"，证明不了**覆盖生效** —— 卡上内容与内置表相同时
+无法区分数据来源。`Synth/port/patch_storage_sd.c` 的 `synth_port_sd_write_test()`：
+把内置音色 0（Init Saw，`cutoff = 150`）的副本只改 `cutoff = 40`，覆盖写进 `/synth/000.syn`
+→ 读回解析确认 `cutoff == 40`（说明数据来自卡，不是内置表）→ 用内置原件写回（恢复卡上模板）
+→ 再读回确认回到 150。选 000 号是因为它就是开机默认音色，测完即恢复，不会在卡上留下怪音色。
+
+结果：`sd_wtest = 0x0F`（覆盖写成功 / 读回是测试值 / 恢复原件成功 / 恢复后读回 = 内置值）。
+
+### 13.3 顺带做的负载复测
+
+12 个音符（4 个通道、含 FM 音色）同时按下：`cpu_permille = 774‰`、`audio_underruns` **不增长**
+（36 → 36），松开后回到 31‰。启动阶段的 36 次欠载来自 SD 写文件 + QSPI 擦除（各几十~几百 ms，
+主循环在那期间喂不上预渲染环），稳态为 0。另外：**每次用调试器 `halt` 读状态本身会让
+`audio_underruns` +1**（连续读数比较时会看到，别误判成播放欠载）。
+
+### 13.4 验证完就关掉（省 flash、不折腾卡）
+
+两项自检验证通过后默认关闭，开关在 `Synth/port/synth_port_config.h`：
+`SYNTH_PORT_SD_WRITE_TEST`、`SYNTH_PORT_QSPI_WRITE_TEST`（都是 `#ifndef` 保护，可用 `-D` 覆盖）。
+关掉后 `status.ps1` 会读成"未运行"（`sd_wtest = 0x80000000`、`qspi_wtest = 0x7FFFFFFF`）；
+同时省下 **~1 KB flash**、不再每次开机写卡/擦闪存，启动期 `audio_underruns` 从 36 降到 22
+（剩下的来自 `-Trim` 之外的日志、SD 只读自检与调试器 halt）。
+关掉后的实测：`FLASH 126,456 B (96.5%)`（text 126,304 + data 152）、`fault = 0`、`sd_mount = 0`、
+`sd_selftest = 0x3D`、`loop_count` 4.97M 在涨、`cpu_permille = 56‰`。
+
+## 14. SD 传输改 DMA（修掉"主循环卡死几十秒"）（2026-10-19 上板验证）
+
+**症状**：切音色 / 开机后主循环像死机 —— `loop_count` 与 `systick_ticks` **双停**（其实是主循环里
+"把探针拷进 `g_app_status`"那句停了，SysTick 本身还在跑）、`audio_underruns` 每秒涨几百（预渲染环喂不上，
+声音断续）、USB/MIDI 不响应；`main_stage = 2`（卡在 `synth_port_patch_service()`），`fault = 0`（没进
+`Error_Handler()`）。
+
+**根因**：FatFs 的 SD 读写走的是**轮询**路径 —— `BSP_SD_ReadBlocks()` → `HAL_SD_ReadBlocks()`
+（`Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_sd.c:726-782`，注释就写着 "Read block(s) in polling
+mode"）靠 CPU 逐字搬 RX FIFO，而音频 DMA 中断优先级是 0：一被抢占就 `RXOVERR`；更糟的是软件超时是
+`SD_TIMEOUT = 30 * 1000`（`FATFS/Target/sd_diskio.c`）⇒ 一次读卡能把主循环卡住 **30 秒**。gdb 栈回溯：
+`PC = HAL_GetTick`、`LR = HAL_SD_ReadBlocks+…`。
+
+**修法**（3 处，都在"本地补丁"区，CubeMX 重生成会覆盖）：
+1. `FATFS/Target/sd_diskio.c`：`SD_read`/`SD_write` 改用 `BSP_SD_ReadBlocks_DMA()` / `BSP_SD_WriteBlocks_DMA()`
+   （SDMMC 内部 IDMA 自己搬数据），等 `BSP_SD_ReadCpltCallback()` / `BSP_SD_WriteCpltCallback()` 清忙标志；
+   超时 `SD_DMA_TIMEOUT_MS = 500`（超时调 `HAL_SD_Abort()`），前后仍 `SCB_CleanInvalidateDCache()`。
+2. `Core/Src/main.c` 的 `App_SdInit()`：`HAL_NVIC_SetPriority(SDMMC1_IRQn, 6, 0)` + `EnableIRQ`；并新增
+   `void SDMMC1_IRQHandler(void) { HAL_SD_IRQHandler(&hsd1); }`（CubeMX 不生成它；以后若在 CubeMX 里
+   勾了 SDMMC1 的 NVIC，它会生成一份到 `Core/Src/stm32h7xx_it.c`，届时删掉那一份）。
+3. `Synth/port/patch_storage_sd.c`：新增 `LoadAllChannelPatchesFromCard()`，由 `synth_port_state_load()`
+   在**起音频之前**（main() 第 8 步）把 16 个通道的 `/synth/NNN.syn` 一次读好，主循环里不再碰卡。
+
+**验证**（release `-Trim` 构建 + 烧写）：`loop_count` 230,927 → 588,301（5 s）、`systick_ticks`
+4,459 → 10,983、`audio_underruns` 稳定在 6（3 次来自开机读卡，另每次调试器 halt 记 1 次）、`fault = 0`、
+`sd_mount = 0`、`state_load = 16`、`ch0=PC5 ch1=PC8`；发 `PC ch2=12` → 从卡加载 FM 音色不再卡顿；
+完整 NRPN（参数号 1 = resonance）送 90 生效：`nrpn_used = 6`、`nrpn_unmapped = 0`、
+`last_nrpn = MSB 0 / LSB 1（参数号 1）= 90`。尺寸：FLASH 124,828 B (95.24%)、RAM 401,952 B (76.67%)、
+DTCMRAM 46,336 B (35.35%)。
+**教训**：上位机测试要用完整 3 字节消息 —— `midiOutShortMsg()` 只传一个字节时，驱动会补两个 0，
+等于发 `CC xx = 0`（我第一次的"NRPN"测试就是这么发坏的，`nrpn_unmapped` 因此虚高）。

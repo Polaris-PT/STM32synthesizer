@@ -1,0 +1,22 @@
+# 统一换行：源码一律 LF（跨平台编译/看 diff 都干净）
+* text=auto eol=lf
+
+# 这些文件本身必须保留原样（PowerShell 脚本带 UTF-8 BOM + CRLF，
+# 一旦被 git 转换，Windows PowerShell 5.1 会把中文注释读成乱码、脚本直接语法错误）
+*.ps1 -text
+*.psm1 -text
+
+# 二进制
+*.wav binary
+*.bin binary
+*.elf binary
+*.hex binary
+*.png binary
+*.jpg binary
+*.pdf binary
+
+# 生成/第三方代码在 diff 里折叠（GitHub 语言统计也干净些）
+Drivers/** linguist-vendored
+Middlewares/** linguist-vendored
+Synth/third_party/** linguist-vendored
+FATFS/** linguist-vendored

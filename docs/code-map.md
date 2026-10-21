@@ -154,19 +154,22 @@ USB 4 字节事件包
 
 | 位置 | 内容 | 删的时候注意 |
 | --- | --- | --- |
-| `Core/Src/main.c` PTD/PV | `g_app_status`（32 u32）、`g_fault`（20 u32，在 `.ram_section`） | 一并删 USER CODE 0 里喂它们的函数 |
-| `Core/Src/main.c` USER CODE 0 | `App_RecordBoot` / `App_LedInit` / `App_LedTask` / `App_UsbKernelClockHz` / `App_SnapshotUsb` / `App_CheckSaiClock` / `App_Fault` / `App_HardFaultRecord*` / `App_FindFaultFrame` / `App_FaultBlinkForever` | `App_HardFaultRecordC` 被 `Core/Src/stm32h7xx_it.c` 的 `HardFault_Handler` 调用，要一并删 |
+| `Core/Src/main.c` PTD/PV | `g_app_status`（46 u32）、`g_fault`（20 u32，在 `.ram_section`） | 一并删 USER CODE 0 里喂它们的函数 |
+| `Core/Src/main.c` USER CODE 0 | `App_RecordBoot` / `App_LedInit` / `App_LedTask` / `App_UsbKernelClockHz` / `App_SnapshotUsb` / `App_CheckSaiClock` / `App_QspiWriteTest`(+`App_QspiCmdInit`/`App_QspiWriteEnable`/`App_QspiWaitWip`) / `App_Fault` / `App_HardFaultRecord*` / `App_FindFaultFrame` / `App_FaultBlinkForever` | `App_HardFaultRecordC` 被 `Core/Src/stm32h7xx_it.c` 的 `HardFault_Handler` 调用，要一并删 |
 | `Core/Src/stm32h7xx_it.c` | SysTick 里 `++g_synth_systick_ticks`、OTG_FS 里 `++g_synth_usb_irq_count` | 同文件里的 `OTG_FS_IRQHandler → tud_int_handler(0)` **不是**诊断（USB 必需），别删 |
 | `Synth/port/debug_uart.[ch]` | 串口日志（8 KB 环形缓冲 + 逐字节 IT + 接管 `_write`） | 把 `SYNTH_PORT_DEBUG_UART` 置 0 即可（全变空实现），不必删文件 |
 | `Synth/port/platform_stm32.c` | `g_synth_systick_ticks` / `g_synth_usb_isr_depth` / `g_synth_usb_clk_rc` | 与 main.c 的探针一起删 |
 | `Synth/port/audio_out_sai.c` | `g_synth_audio_isr_depth` / `g_synth_audio_last_half` / XRUN 日志 | 同上 |
 | `Synth/port/usb_midi_tinyusb.c` | `g_synth_midi_rx_bytes` / `g_synth_usb_mount_count` / `g_synth_usb_umount_count` / `g_synth_usb_irq_count` | 同上 |
+| `Synth/port/patch_storage_sd.c` | `synth_port_sd_selftest` / `synth_port_sd_write_test`（覆盖写-读回-恢复，会真的写卡上 000.syn 再还原） | 删这两个函数 + main.c 里的调用；**注意 `synth_port_sd_write_test()` 会动卡上 000.syn**（测完恢复） |
 | `tools/status.ps1` | PC 侧读回并解码 | 纯脚本，不影响固件 |
 
-三个开关都在 `Synth/port/synth_port_config.h`：
+五个开关都在 `Synth/port/synth_port_config.h`：
 
 - `SYNTH_PORT_DEBUG_UART`：1 = 串口日志（默认），0 = 空实现（省 flash）
 - `SYNTH_PORT_MIDI_TRACE`：每个 USB-MIDI 事件包打一行（默认 0，查"音停不下来"时开）
 - `SYNTH_PORT_FAULT_RESET`：0 = HardFault 后停住闪灯（默认），1 = 记录完软复位、自动恢复发声
+- `SYNTH_PORT_SD_WRITE_TEST`：1 = 开机跑"覆盖写 000.syn → 读回确认 → 恢复原件"（默认 0，2026-10-19 已通过 `0x0F`）
+- `SYNTH_PORT_QSPI_WRITE_TEST`：1 = 开机擦写 QSPI 最后 4 KB 扇区并读回比对（默认 0，2026-10-19 已通过 `qspi_wtest = 0`）
 
 实测成本：诊断 + 串口日志约占 **8~11 KB flash**；`g_app_status` 128 B + `g_fault` 80 B 的 RAM（`.ram_section`）。

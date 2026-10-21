@@ -27,6 +27,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "ff_gen_drv.h"
 #include "sd_diskio.h"
+#include "sdmmc.h"      /* hsd1：超时中止（HAL_SD_Abort）要用到句柄 */
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -144,24 +145,45 @@ DSTATUS SD_status(BYTE lun)
   * @retval DRESULT: Operation result
   */
 
+#define SD_DMA_TIMEOUT_MS 500u
+static volatile uint8_t g_sd_busy = 0u;   /* 1 = 有一笔 DMA 传输在跑（回调里清零） */
+
+/* 本地补丁（CubeMX 重新生成会覆盖，见 docs/handoff.md）：
+   改用 SDMMC 内部 IDMA 的 DMA 传输 + 完成回调等待，**不再用轮询模式**。
+   原因：BSP_SD_ReadBlocks()（= HAL_SD_ReadBlocks）靠 CPU 逐字读 RX FIFO，而音频 DMA 中断
+   优先级是 0 —— 只要被它抢占超过 FIFO 深度就会 RXOVERR，更糟的是软件超时是 30 s（SD_TIMEOUT），
+   主循环会被卡住整分钟：预渲染环喂不上（实测 audio_underruns 每秒涨几百）、USB 也不响应。
+   IDMA 自己搬数据，CPU 只等一个标志，就不怕被音频中断打断。 */
+void BSP_SD_ReadCpltCallback(void)  { g_sd_busy = 0u; }
+void BSP_SD_WriteCpltCallback(void) { g_sd_busy = 0u; }
+void HAL_SD_ErrorCallback(SD_HandleTypeDef *hsd) { (void)hsd; g_sd_busy = 0u; }
+
+/* 等 DMA 完成；返回 0 = 完成、-1 = 超时（并中止这次传输） */
+static int SdWaitDma(void) {
+  const uint32_t t0 = HAL_GetTick();
+  while (g_sd_busy) {
+    if ((uint32_t)(HAL_GetTick() - t0) >= SD_DMA_TIMEOUT_MS) {
+      (void)HAL_SD_Abort(&hsd1);
+      g_sd_busy = 0u;
+      return -1;
+    }
+  }
+  return 0;
+}
+
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
+  (void)lun;
 
-  /* 本地补丁（CubeMX 重新生成会覆盖，见 docs/handoff.md）：SDMMC 用芯片内部 IDMA
-     直接写 AXI SRAM，绕开 D-Cache —— 不清缓存会读到旧数据（表现为文件内容错乱/FR_INT_ERR）。
-     这里的调用频率是"每扇区一次"，不在音频路径上，整片 clean+invalidate 足够安全。 */
+  /* 本地补丁：SDMMC 用芯片内部 IDMA 直接写 AXI SRAM，绕开 D-Cache ——
+     传输前清掉脏行（否则回写会盖掉 IDMA 的结果），传输后再 clean+invalidate 让 CPU 看到新数据。 */
   SCB_CleanInvalidateDCache();
-  if(BSP_SD_ReadBlocks((uint32_t*)buff,
-                       (uint32_t) (sector),
-                       count, SD_TIMEOUT) == MSD_OK)
-  {
-    /* wait until the read operation is finished */
-    while(BSP_SD_GetCardState()!= MSD_OK)
-    {
-    }
-    res = RES_OK;
+  g_sd_busy = 1u;
+  if (BSP_SD_ReadBlocks_DMA((uint32_t*)buff, (uint32_t)sector, count) == MSD_OK) {
+    if (SdWaitDma() == 0) res = RES_OK;
   }
+  g_sd_busy = 0u;
   SCB_CleanInvalidateDCache();
 
   return res;

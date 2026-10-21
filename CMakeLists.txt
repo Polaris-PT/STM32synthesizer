@@ -52,7 +52,7 @@ add_executable(${CMAKE_PROJECT_NAME})
 # 消失，实机现象是 SAI/QSPI/SD 全没配（fault = 0x126、没声音、QSPI 映射失败）。
 # 给 HAL 库加 -fno-lto 能修好弱符号，但省下来的就只剩 ~144 B（119,928 B），不值得；
 # 给 Core/Src 加 -fno-lto 无效（目标级 -flto 在命令行上排得更靠后）。
-# 结论：不提供 LTO 开关，发布版用 SYNTH_RELEASE + 冷路径 -Os（120,072 B / 91.61%）就够。
+# 结论：不提供 LTO 开关，发布版用 SYNTH_RELEASE + 冷路径 -Oz（120,072 B / 91.61%）就够。
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -100,22 +100,31 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 set_source_files_properties(${SYNTH_ENGINE_SOURCES} ${SYNTH_PORT_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-O3;-ffast-math;-fno-math-errno")
 
+# 冷路径覆盖（必须写在上面那条之后，后写的生效）：文本音色/乐器的解析与序列化只在
+# SD 卡读写时用（主循环里），不在音频线程 ⇒ 用 -Oz 换 flash。
+# arp.cpp 严格说不是纯冷路径（每块跑一次），但一次只处理几个音符事件，-Oz 够用。
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/src/app/patch_text.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/src/app/instrument_text.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/src/app/arp.cpp"
+    PROPERTIES COMPILE_OPTIONS "-Oz")
+
 # ---------------------------------------------------------------------------
-# FatFs / SD 驱动不在实时路径上 → 用 -Os 编译，把 flash 留给合成器。
+# FatFs / SD 驱动不在实时路径上 → 用 -Oz 编译，把 flash 留给合成器。
 # 背景：H750 只有 128 KB flash。打开 SD（SYNTH_PORT_SD_ENABLE=1）后 FatFs + SDMMC
 # HAL 约 +18 KB，2026-10-19 曾把 .rodata 挤出 FLASH 2,616 B。本文件 CubeMX 只生成一次
 # （重新生成不会覆盖），而 cmake/stm32cubemx/CMakeLists.txt 每次都会被重写，
 # 所以与尺寸有关的编译开关放在这里。
 # ---------------------------------------------------------------------------
-target_compile_options(FatFs PRIVATE -Os)
-target_compile_options(STM32_Drivers PRIVATE -Os)
+target_compile_options(FatFs PRIVATE -Oz)
+target_compile_options(STM32_Drivers PRIVATE -Oz)
 set_source_files_properties(
     "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/App/fatfs.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/bsp_driver_sd.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/sd_diskio.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/fatfs_platform.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sdmmc.c"
-    PROPERTIES COMPILE_OPTIONS "-Os"
+    PROPERTIES COMPILE_OPTIONS "-Oz"
 )
 
 # ---------------------------------------------------------------------------
@@ -133,7 +142,7 @@ if(SYNTH_RELEASE)
     message(STATUS "SYNTH_RELEASE=ON：调试串口日志已关闭（诊断字符串不再进 flash）")
 endif()
 
-# 非热路径用 -Os：CubeMX 应用源 + "冷"端口层文件（DSP 热路径与音频 ISR 仍是 -O3）。
+# 非热路径用 -Oz：CubeMX 应用源 + "冷"端口层文件（DSP 热路径与音频 ISR 仍是 -O3）。
 # audio_out_sai.c 故意不在此列：它的 DMA 回调在优先级 0 的中断里跑。
 set(SYNTH_CUBEMX_APP_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/main.c"
@@ -144,7 +153,7 @@ set(SYNTH_CUBEMX_APP_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/usart.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/quadspi.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sai.c")
-set_source_files_properties(${SYNTH_CUBEMX_APP_SOURCES} PROPERTIES COMPILE_OPTIONS "-Os")
+set_source_files_properties(${SYNTH_CUBEMX_APP_SOURCES} PROPERTIES COMPILE_OPTIONS "-Oz")
 
 set_source_files_properties(
     "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/platform_stm32.c"
@@ -152,8 +161,14 @@ set_source_files_properties(
     "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/patch_storage_sd.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/sample_storage_sd.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/sample_storage_qspi.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/qspi_flash.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/module.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/module_upload.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/debug_uart.c"
-    PROPERTIES COMPILE_OPTIONS "-Os")
+    # 文本解析（.syn/.ins 载入）只在从卡里读文件时跑，放 -Oz 白赚几百字节
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/src/app/patch_text.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Synth/src/app/instrument_text.cpp"
+    PROPERTIES COMPILE_OPTIONS "-Oz")
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
@@ -177,7 +192,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "${TINYUSB_SRC}/portable/synopsys/dwc2/dwc2_common.c"
 )
 
-# TinyUSB 也不在实时路径上（重型工作在 tud_task()，主循环里）→ -Os 省 flash
+# TinyUSB 也不在实时路径上（重型工作在 tud_task()，主循环里）→ -Oz 省 flash
 set_source_files_properties(
     "${TINYUSB_SRC}/tusb.c"
     "${TINYUSB_SRC}/common/tusb_fifo.c"
@@ -185,7 +200,7 @@ set_source_files_properties(
     "${TINYUSB_SRC}/class/midi/midi_device.c"
     "${TINYUSB_SRC}/portable/synopsys/dwc2/dcd_dwc2.c"
     "${TINYUSB_SRC}/portable/synopsys/dwc2/dwc2_common.c"
-    PROPERTIES COMPILE_OPTIONS "-Os"
+    PROPERTIES COMPILE_OPTIONS "-Oz"
 )
 
 # Remove wrong libob.a library dependency when using cpp files
@@ -197,3 +212,47 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
+
+# ---------------------------------------------------------------------------
+# RAM overlay 模块（TFT UI 等"可选功能"）：独立编译、独立链接到 AXI SRAM 顶部
+# （0x24070000，链接脚本里的 MODULE_RAM 段），产物是板子认的 ui.bin（36 B 头 + 裸镜像）。
+# 运行时由 module.c 校验 CRC 后整段拷进 RAM 执行 —— 不占内部 flash，也不受 128 KB 限制。
+# 用法：构建后把 build/ui.bin 拷到 SD 卡 /synth/ui.bin，上电自动导入 QSPI。
+# 详细设计见 Synth/port/module_api.h。
+# ---------------------------------------------------------------------------
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    set(SYNTH_PYTHON "${Python3_EXECUTABLE}")
+else()
+    set(SYNTH_PYTHON "python")
+endif()
+
+set(SYNTH_MODULE_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/Synth/module")
+set(SYNTH_MODULE_ELF  "${CMAKE_BINARY_DIR}/ui_module.elf")
+set(SYNTH_MODULE_BIN  "${CMAKE_BINARY_DIR}/ui.bin")
+
+add_custom_command(
+    OUTPUT "${SYNTH_MODULE_ELF}"
+    COMMAND "${CMAKE_C_COMPILER}"
+            -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard
+            -O2 -g -ffunction-sections -fdata-sections -fno-common -fno-builtin
+            -nostdlib -nostartfiles
+            -I "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port"
+            -T "${SYNTH_MODULE_DIR}/module.ld"
+            -Wl,--gc-sections
+            "-Wl,-Map=${CMAKE_BINARY_DIR}/ui_module.map"
+            "${SYNTH_MODULE_DIR}/ui.c" -o "${SYNTH_MODULE_ELF}"
+    DEPENDS "${SYNTH_MODULE_DIR}/ui.c" "${SYNTH_MODULE_DIR}/module.ld"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Synth/port/module_api.h"
+    COMMENT "构建 RAM overlay 模块（ui_module.elf）"
+    VERBATIM)
+
+add_custom_command(
+    OUTPUT "${SYNTH_MODULE_BIN}"
+    COMMAND "${SYNTH_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_module.py"
+            --elf "${SYNTH_MODULE_ELF}" --out "${SYNTH_MODULE_BIN}"
+    DEPENDS "${SYNTH_MODULE_ELF}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_module.py"
+    COMMENT "打包 ui.bin（头 + 裸镜像）"
+    VERBATIM)
+
+add_custom_target(ui_module ALL DEPENDS "${SYNTH_MODULE_BIN}")

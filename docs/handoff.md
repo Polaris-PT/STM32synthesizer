@@ -36,7 +36,7 @@
 | `Synth/src/engines/` | DX7 六运算器 FM（msfa）+ `.syx` 解析 |
 | `Synth/port/` | **唯一接触 HAL/TinyUSB/FatFs 的地方**（上板胶水） |
 | `host/` | 离线渲染 + 单元测试（mingw g++，无需硬件） |
-| `docs/` | cubemx-checklist / architecture / patch-format / instrument-format / midi-cc-map |
+| `docs/` | cubemx-checklist / architecture / patch-format / instrument-format / midi-map（音色号+CC+NRPN）/ sample-library / **overlay（RAM overlay 模块）** / code-map / perf-notes / phase2-review |
 
 常用命令：
 ```powershell
@@ -53,13 +53,18 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
 - ROMpler：多音区 + 重采样音高正确、循环持续、释音归零；`.ins` 解析/往返/错误处理通过。
 - 体积（交叉编译 Cortex-M7 -O2）：自有代码 `.text` **37,455B**；加 HAL+FatFs+SAI(40-50KB)+TinyUSB(10-15KB) ≈ **88-103KB/128KB** ✓。
 - 体积（**实机固件，2026-10-19 实测**，SD+FATFS 已启用）：
-  - 默认构建（串口日志开，日常调试用）：**FLASH 124,792 B / 128 KB = 95.21%**（`build\RelWithDebInfo`）
-  - 发布构建 `tools\build.ps1 -Trim`（关调试日志 + 冷路径 -Os）：**FLASH 120,072 B = 91.61%**（`build\release`）
+  - 默认构建（串口日志开，日常调试用）：**FLASH 127,456 B / 128 KB = 97.2%**（`build\RelWithDebInfo`）
+  - 发布构建 `tools\build.ps1 -Trim`（关调试日志 + 冷路径 -Os）：**FLASH 122,624 B = 93.6%**
+    ⚠ `-Trim` **不会**换目录（还是 `build\<BuildType>`），要用独立目录得显式 `-BuildDir`。
   - 其它区两版相同：AXI RAM 400,800 B (76.45%)、DTCMRAM 46,336 B (35.35%)
-  - ⇒ 发布版留 **~10.7 KB** flash 余量，**QSPI XIP（把 FatFs/TinyUSB 搬到外部 flash）暂时不必做**。
+  - ⇒ 发布版留 **~8 KB** flash 余量；默认版只剩 ~3.5 KB —— **下一批新功能前先考虑删诊断代码**
+    （`docs/code-map.md` §9 的清单，8~11 KB）或让默认构建也走 `SYNTH_RELEASE`。
   - 两个版本都已上板验证：发布版 `-Trim` 实测 `fault = 0`、`usb_mounted = 1`、`audio_ck = 24.576 MHz`、
     `sai_mckdiv = 2`、`qspi_id = 0xEF4017`、发 4 组 note on/off 后 `midi_rx_bytes = 1218`、`cpu_permille = 232‰`、
     `audio_underruns = 0`、`status.ps1` 结论 `✓ 固件侧一切正常`。
+  - 2026-10-19 又加了两项自检并上板通过：`qspi_wtest = 0`（QSPI 擦/写/映射读回一致，`qspi_wtest_rd = 0x514E5953`）、
+    `sd_wtest = 0x0F`（卡上内容覆盖生效 + 恢复原件）；12 音负载 `cpu_permille = 774‰`、`audio_underruns` 不增长
+    （细节见 `docs/phase2-review.md` §13）。
 - **LTO 试过并放弃**（`-flto` 能到 116,172 B / 88.63%，省 ~4 KB，但和 HAL 的弱符号覆盖模式冲突）：
   HAL 里 `HAL_*_MspInit()` 是 `__weak` 空实现、强定义在我们的 `Core/Src/*.c`；整程序 LTO 时 GCC 让库里那个
   弱版本"胜出"，ELF 里 `HAL_SAI_MspInit` 符号整个消失 → 实机 `fault = 0x126`（SAI 时钟/SAI DMA/AUDIO_START/QSPI_MM
@@ -111,10 +116,27 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
      对外 API：`synth_set_channel_patch(ch, idx)` / `synth_get_channel_patch(ch)`（越界 0xFFFF）。
      已知限制：FM 引擎一次只能载入一条 DX7 音色（两个不同 FM 音色的通道会来回换载）、ROMpler 乐器全局一个、
      效果链全局一条（参数跟随"主音色"`e.patch`，即最后一次切换的音色）。
-   - SD 卡：`SYNTH_PORT_SD_ENABLE = 1`；**插卡才挂载**（PD4 低 = 卡在座，没卡 `sd_mount = -2` 且不置故障位，
-     因为没卡时 `hsd1` 未初始化、直接 `f_mount` 会走到 `HAL_SD_Init` 上）。
-     文件约定 `0:/synth/NNN.syn`（文本音色或 DX7 `.syx`）与 `0:/synth/NNN.ins`（采样乐器）：
-     Program Change 后主循环的 `synth_port_patch_service()` 发现音色号变化就尝试从 SD 覆盖内置音色。
+   - SD 卡：`SYNTH_PORT_SD_ENABLE = 1`；开机自己配 SDMMC1（`Core/Src/main.c` 的 `App_SdInit()`，
+     **允许失败**：没卡时 `sd_mount = -3` 且不置故障位；CubeMX 生成的 `MX_SDMMC1_SD_Init()` 失败会
+     `Error_Handler()` 把整块板停住，所以不用它）。文件约定 `0:/synth/NNN.syn`（文本音色或 DX7 `.syx`）
+     与 `0:/synth/NNN.ins`（采样乐器）：Program Change 后主循环的 `synth_port_patch_service()`
+     发现音色号变化就尝试从 SD 覆盖内置音色。挂载成功后跑一次自检并把 15 个内置音色导出成
+     `/synth/NNN.syn` 模板（**只写不存在的文件**，卡上改过的不被覆盖）；结果进 `g_app_status.sd_selftest`
+     （见 `Synth/port/patch_storage_sd.c` 顶部位定义）与 `sd_exported`。
+   - **SD 打通的三个坑（2026-10-19，均已上板验证）**：
+     ① `FATFS/Target/fatfs_platform.c` 的 `BSP_PlatformIsDetected()` 按 PD4 判断卡在不在，而本板
+        PD4 恒为高、根本没有卡检测脚（WeAct 例程也没有）⇒ 插好的卡被判"不存在" → `f_mount` 报
+        `FR_NOT_READY(3)`。已改成直接 `return SD_PRESENT`（本地修改，CubeMX 会覆盖）。
+     ② 别把 DAT3(PC11) 当普通 GPIO 顶高：4-bit 传输要占这条线（`bsp_driver_sd.c` 的 `BSP_SD_Init()`
+        之后会调 `HAL_SD_ConfigWideBusOperation(..., SDMMC_BUS_WIDE_4B)`），抢线会得到
+        `RX_OVERRUN(32)` → `FR_DISK_ERR(1)`。
+     ③ `hsd1.Init.ClockDiv` 不能是 0：48 MHz 内核下 HAL 的 `HAL_SD_ConfigWideBusOperation()`
+        （`stm32h7xx_hal_sd.c:2469`）会把 CLKDIV 写成 0 = **分频旁路**（48 MHz 直接怼卡，超 25 MHz
+        默认速率上限）⇒ 同样是 `RX_OVERRUN`。现在写 1 = 24 MHz（识别阶段由 HAL 自己算 393 kHz，不受影响）。
+     ④ 诊断入口：`g_app_status.sd_err` = 失败时的 `hsd1.ErrorCode`（`tools/status.ps1` 逐位解码）；
+        `sd_mount` 现在直接返回 FatFs 的 `FRESULT`（1 = FR_DISK_ERR、3 = FR_NOT_READY、13 = FR_NO_FILESYSTEM…）。
+     - 旧卡（吃灰半年那张）**不是坏的**：格式化成 FAT32 后一次就通（`sd_selftest = 0x2F`、导出 15 个文件）；
+       之前两次失败是"旧卡 + 旧固件"叠加，不能只怪卡。
    - 为塞进 128 KB flash：FatFs 关掉 `_USE_MKFS`/`_USE_FASTSEEK`/`_USE_STRFUNC` 并开 `_FS_TINY`
      （`FATFS/Target/ffconf.h`）；`FatFs` 库、`STM32_Drivers` 里的 `sdmmc.c`、TinyUSB 六个源文件用 `-Os`
      编译（`CMakeLists.txt`）。`FATFS/Target/sd_diskio.c` 的 `SD_read/SD_write` 前后各加一次
@@ -155,15 +177,18 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
      ⚠ 三个 .ps1 必须保持 **UTF-8 BOM**：PowerShell 5.1 会把无 BOM 的 UTF-8 当 GBK 读，中文注释乱码后
      整个脚本报 `Unexpected token`；而 `edit` 工具会**悄悄抹掉 BOM**，改完必须补回。
 5. **仍需做**：
-   - ⚠ 启用 SD（`Synth/port/synth_port_config.h` 的 `SYNTH_PORT_SD_ENABLE` 置 1）之前，先解决
-     SDMMC 内部 IDMA 与 D-Cache 的一致性（FATFS 对象/采样池目前是可缓存的 AXI SRAM）。
-     SD 路径本身已能编译+链接（顺手修掉两个藏在开关后面的 bug：`patch_storage_sd.c` 少了
-     `synth_port.h` 导致 `synth_port_instrument_load` 隐式声明、`sample_storage_sd.c` 还在用旧宏名
-     `SYNTH_SAMPLE_POOL_BYTES`），采样池默认已从 256 KB 降到 128 KB（256 KB 时 AXI 99.88%）。
-   - 真机验证：DMA/Cache 一致性、CPU 负载与 xrun 计数、QSPI 采样读取（dummy cycles 若错位改 6）。
-   - 采样增强：速度分层 + "最近根音"音区选择、WAV 8/24bit 支持、采样库清单扫描（`/synth/*.ins` 列表）。
+   - QSPI 存储已在验证范围（见上）：最后 4 KB 扇区 `0x7FF000` 归自检用，采样库避开它。
+   - 采样增强：速度分层 + "最近根音"音区选择、WAV 8/24bit 支持、采样库清单扫描（`/synth/*.ins` 列表）、
+     多采样映射（一个 `.ins` 挂多个 WAV）。
+   - 下一步优先级见 `docs/phase2-review.md` §13 之后的路线（音色持久化 / MIDI CC+NRPN / 板载换音色 /
+     QSPI 采样库打包工具）。
 
 ## 6. 踩过的坑（别重复踩）
+- **SD 传输千万别用轮询**：`HAL_SD_ReadBlocks()` 是 CPU 逐字搬 RX FIFO（`stm32h7xx_hal_sd.c:726`
+  的 "polling mode"），音频 DMA 中断（优先级 0）一抢占就溢出，而 `SD_TIMEOUT` 是 **30 秒**
+  ⇒ 主循环能卡死半分钟，现象像"板子死了"（其实 SysTick 还在跑，是主循环那句拷贝探针停了）。
+  已改成 SDMMC 内部 IDMA + 完成回调（`FATFS/Target/sd_diskio.c`，详见 `docs/phase2-review.md` §14），
+  并给 `SDMMC1_IRQn` 使能中断（优先级 6）+ 在 `Core/Src/main.c` 里定义 `SDMMC1_IRQHandler`。
 - msfa：必须先调 `Exp2/Tanh/Sin/Freqlut/Env/PitchEnv/Porta/Lfo` 的 init，否则空表指针 → 0xC0000005；
   `ctrls_.core` 必须指向 `EngineMsfa` 实例；类名是 `Freqlut`。
 - 弱符号在 MinGW/PE 下不工作 → 引擎用 `synth_platform_hooks_t` 钩子表。
@@ -206,3 +231,5 @@ cmake -G Ninja -S host -B host/build ; cmake --build host/build
 - **`edit` 工具会抹掉 `.ps1` 的 UTF-8 BOM**，症状是脚本报 `Unexpected token`（还伴随中文提示乱码），
   很像"脚本逻辑被改坏了"。改完立刻补：
   `[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))`。
+
+- **RAM overlay 模块的两个坑**：① 	ools\upload_module.py 的 USB 标记打在头部偏移 32（reserved[1]），固件早期查 reserved[0]（偏移 28）→ 每次上电被 SD 卡上的旧 ui.bin 覆盖（症状：上传后正常、重启就退回旧版；用 status.ps1 的 module_crc 对比 make_module 的 CRC 判断）；② synth_module_init() 幂等，上传后必须先 synth_module_unload()。
